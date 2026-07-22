@@ -1,0 +1,225 @@
+mmc/dma: rda: fix IRQ/locking hazards in the backported SD/MMC stack
+
+Four hardening fixes for the RDA8810PL SD/MMC backport, addressing an
+intermittent total system freeze during card init / sustained I/O:
+
+1. rda-mmc hardirq: never return IRQ_NONE. The SDMMC line is level-
+   triggered with IRQF_ONESHOT; the handler has already cleared the
+   source, and IRQ_NONE lets the unhandled-irq machinery fight the
+   ONESHOT masking, which can wedge a UP system.
+2. rda-mmc set_ios: regulator_enable/disable can sleep — call them
+   after dropping priv->lock (was: inside spin_lock_irqsave).
+3. rda-mmc irq thread + request timeout: run dmaengine_terminate_sync
+   and abort outside priv->lock; claim/clear priv->mrq under the lock
+   only.
+4. rda-ifc: terminate_all used readl_poll_timeout (sleeps, up to 1 s)
+   under a spinlock with irqs off — use a short atomic poll and write a
+   clean DISABLE control word (never ENABLE|DISABLE together, never
+   leave FLUSH set). tx_status treated channel FIFO_EMPTY as
+   completion — require the transfer counts to have drained instead.
+
+Upstream-Status: Inappropriate [local hardening of a backported not-yet-merged series]
+
+Signed-off-by: Sergio Marin <sergio.marin@pantacor.com>
+---
+
+--- a/drivers/mmc/host/rda-mmc.c
++++ b/drivers/mmc/host/rda-mmc.c
+@@ -440,6 +440,7 @@
+ 					msecs_to_jiffies(5000)) == 0) {
+ 			spin_lock_irqsave(&priv->lock, flags);
+ 			priv->mrq = NULL;
++			spin_unlock_irqrestore(&priv->lock, flags);
+ 
+ 			chan = rda_mmc_get_dma_chan(priv, data);
+ 
+@@ -448,7 +449,8 @@
+ 
+ 			req->cmd->error = -ETIMEDOUT;
+ 			req->data->error = -ETIMEDOUT;
+-			goto done_irqunlock;
++			mmc_request_done(host, req);
++			return;
+ 		}
+ 	}
+ 
+@@ -469,6 +471,7 @@
+ 	unsigned int clk_div;
+ 	unsigned long flags;
+ 	u32 reg_mclk = 0;
++	int vmmc_change = 0;
+ 	int ret;
+ 
+ 	spin_lock_irqsave(&priv->lock, flags);
+@@ -480,15 +483,10 @@
+ 
+ 	if (priv->power_mode != ios->power_mode) {
+ 		priv->power_mode = ios->power_mode;
+-		if (priv->power_mode == MMC_POWER_UP) {
+-			ret = regulator_enable(priv->vmmc);
+-			if (ret)
+-				dev_err(dev, "Failed to turn on vmmc\n");
+-		} else if (priv->power_mode == MMC_POWER_OFF) {
+-			ret = regulator_disable(priv->vmmc);
+-			if (ret)
+-				dev_err(dev, "Failed to turn off vmmc\n");
+-		}
++		if (priv->power_mode == MMC_POWER_UP)
++			vmmc_change = 1;
++		else if (priv->power_mode == MMC_POWER_OFF)
++			vmmc_change = -1;
+ 	}
+ 
+ 	if (priv->clock != ios->clock) {
+@@ -532,6 +530,17 @@
+ 			ios->bus_width, ios->clock, ios->power_mode);
+ 
+ 	spin_unlock_irqrestore(&priv->lock, flags);
++
++	/* regulator ops may sleep — never call them under priv->lock */
++	if (vmmc_change > 0) {
++		ret = regulator_enable(priv->vmmc);
++		if (ret)
++			dev_err(dev, "Failed to turn on vmmc\n");
++	} else if (vmmc_change < 0) {
++		ret = regulator_disable(priv->vmmc);
++		if (ret)
++			dev_err(dev, "Failed to turn off vmmc\n");
++	}
+ }
+ 
+ static void rda_mmc_crc_status(struct mmc_host *host)
+@@ -571,7 +580,13 @@
+ 	void __iomem *base = priv->base;
+ 	struct mmc_request *mrq;
+ 	u32 status;
+-	irqreturn_t irqret = IRQ_NONE;
++	/*
++	 * Level-triggered line with IRQF_ONESHOT: the handler must always
++	 * consume the interrupt (we cleared the source above); returning
++	 * IRQ_NONE lets the unhandled-irq machinery fight the ONESHOT
++	 * masking and can wedge the (UP) system.
++	 */
++	irqreturn_t irqret = IRQ_HANDLED;
+ 
+ 	status = readl(base + SDMMC_REG_INT_STATUS);
+ 	writel((status & 0xFF), base + SDMMC_REG_INT_CLEAR);
+@@ -603,10 +618,6 @@
+ 		irqret = IRQ_HANDLED;
+ 
+ irq_done:
+-	if (irqret == IRQ_NONE)
+-		dev_info(dev,
+-			"Unexpected IRQ - was a data transfer requested? IRQ: 0x%x\n", status);
+-
+ 	return irqret;
+ }
+ 
+@@ -624,19 +635,16 @@
+ 	if (WARN_ON(!priv->mrq))
+ 		return IRQ_NONE;
+ 
++	/* Claim the request under the lock; do all slow work outside it. */
+ 	spin_lock_irqsave(&priv->lock, flags);
+-
+ 	mrq = priv->mrq;
++	priv->mrq = NULL;
++	spin_unlock_irqrestore(&priv->lock, flags);
+ 
+ 	if (mrq->data) {
+ 		chan = rda_mmc_get_dma_chan(priv, mrq->data);
+ 
+-		if (mrq->data->error) {
+-			mrq->data->bytes_xfered = 0;
+-			rda_mmc_crc_status(host);
+-			dmaengine_terminate_sync(chan);
+-			rda_mmc_data_abort(host, mrq);
+-		} else {
++		if (!mrq->data->error) {
+ 			mrq->data->bytes_xfered =
+ 				mrq->data->blocks * mrq->data->blksz;
+ 
+@@ -650,16 +658,18 @@
+ 				dev_err(dev, "Transmit IRQ triggered but DMA is not finished\n");
+ 				mrq->data->error = -ETIMEDOUT;
+ 				mrq->data->bytes_xfered = 0;
+-				dmaengine_terminate_sync(chan);
+-				rda_mmc_data_abort(host, mrq);
+ 			}
+ 		}
+ 
+-		/* Successful read: copy the bounce out to the caller. */
+-		if (!mrq->data->error && (mrq->data->flags & MMC_DATA_READ))
++		if (mrq->data->error) {
++			rda_mmc_crc_status(host);
++			rda_mmc_data_abort(host, mrq);
++		} else if (mrq->data->flags & MMC_DATA_READ) {
++			/* Successful read: copy the bounce out to the caller. */
+ 			sg_copy_from_buffer(mrq->data->sg, mrq->data->sg_len,
+ 					    priv->bounce,
+ 					    mrq->data->bytes_xfered);
++		}
+ 
+ 		/*
+ 		 * Since we told the controller to automatically send a stop command,
+@@ -668,9 +678,6 @@
+ 		dmaengine_terminate_sync(chan);
+ 	}
+ 
+-	priv->mrq = NULL;
+-	spin_unlock_irqrestore(&priv->lock, flags);
+-
+ 	complete(&priv->c);
+ 	mmc_request_done(host, mrq);
+ 
+--- a/drivers/dma/rda-ifc.c
++++ b/drivers/dma/rda-ifc.c
+@@ -232,18 +232,17 @@
+ 
+ 	status = readl(ifc_chan->chan_base + 4);
+ 
+-	if (status & IFC_STATUS_FIFO_EMPTY)
++	/* Completion means the transfer counts have drained to zero;
++	 * FIFO_EMPTY only reflects the channel FIFO between bursts. */
++	for (i = 0; i < ifc_chan->rda_ifc->sg_max; i++) {
++		tmp_residue = readl(ifc_chan->chan_base + 12 + (8 * i));
++		residue += tmp_residue;
++	}
++
++	if (residue == 0 && (status & IFC_STATUS_FIFO_EMPTY)) {
+ 		dmaret = DMA_COMPLETE;
+-	else
++	} else {
+ 		dmaret = DMA_IN_PROGRESS;
+-
+-	if (dmaret == DMA_IN_PROGRESS) {
+-		/* gather residue from all sg */
+-		for (i = 0; i < ifc_chan->rda_ifc->sg_max; i++) {
+-			tmp_residue = readl(ifc_chan->chan_base + 12 + (8 * i));
+-			residue += tmp_residue;
+-		}
+-
+ 		dma_set_residue(tx_state, residue);
+ 	}
+ 
+@@ -274,14 +273,18 @@
+ 		control |= IFC_CTL_FLUSH;
+ 		writel(control, ifc_chan->chan_base);
+ 
+-		ret = readl_poll_timeout(ifc_chan->chan_base + 4, status,
+-				(status & IFC_STATUS_FIFO_EMPTY), 100, 1000*1000);
++		/* Short atomic poll: never spin for a second with the
++		 * channel lock held and irqs off. */
++		ret = readl_poll_timeout_atomic(ifc_chan->chan_base + 4, status,
++				(status & IFC_STATUS_FIFO_EMPTY), 10, 10000);
+ 		if (ret < 0)
+ 			dev_err(dev, "Timed out flushing FIFO\n");
+ 	}
+ 
+ clear_chan:
++	/* Clean disable word (never ENABLE|DISABLE or FLUSH left set). */
+ 	control = readl(ifc_chan->chan_base);
++	control &= ~(IFC_CTL_ENABLE | IFC_CTL_FLUSH);
+ 	control |= IFC_CTL_DISABLE;
+ 	writel(control, ifc_chan->chan_base);
+ 

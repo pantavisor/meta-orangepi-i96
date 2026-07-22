@@ -1,0 +1,31 @@
+Not all GPIO have IRQ. When we use this driver with
+GPIOC (handled by modem) we get:
+
+rda-gpio 11a08000.gpioc: error -ENXIO: IRQ index 0 not found
+
+Let's mark IRQ as optional so this error doesn't show up.
+
+Signed-off-by: Dang Huynh <dang.huynh@mainlining.org>
+
+Upstream-Status: Submitted [https://lore.kernel.org/all/20250919-rda8810pl-mmc-v1-9-d4f08a05ba4d@mainlining.org/]
+---
+ drivers/gpio/gpio-rda.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/gpio/gpio-rda.c b/drivers/gpio/gpio-rda.c
+index fb479d13eb01a49218ad4229e7d4f70f096f5a2e..7d20dbbb6ec41149a1dbf4d9ef9ac86449773c35 100644
+--- a/drivers/gpio/gpio-rda.c
++++ b/drivers/gpio/gpio-rda.c
+@@ -229,7 +229,7 @@ static int rda_gpio_probe(struct platform_device *pdev)
+ 	 * RDA8810PL, GPIOC doesn't support interrupt. So we must handle
+ 	 * those also.
+ 	 */
+-	rda_gpio->irq = platform_get_irq(pdev, 0);
++	rda_gpio->irq = platform_get_irq_optional(pdev, 0);
+ 
+ 	rda_gpio->base = devm_platform_ioremap_resource(pdev, 0);
+ 	if (IS_ERR(rda_gpio->base))
+
+-- 
+2.51.0
+

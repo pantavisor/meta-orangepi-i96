@@ -1,0 +1,333 @@
+i2c: add RDA8810PL I2C master controller driver
+
+PIO/polled forward-port of the vendor 3.10 i2c-rda.c to the modern I2C
+and DT frameworks. Needed to talk to the RDA599x WiFi/BT combo chip,
+whose power controller and identification interface are I2C clients
+(wifi_core@0x13, wifi_rf@0x14, bt_core@0x15, bt_rf@0x16 on i2c1).
+
+Upstream-Status: Inappropriate [local forward-port pending proper upstream submission]
+
+Signed-off-by: Sergio Marin <sergio.marin@pantacor.com>
+---
+
+diff --git a/drivers/i2c/busses/Kconfig b/drivers/i2c/busses/Kconfig
+--- a/drivers/i2c/busses/Kconfig
++++ b/drivers/i2c/busses/Kconfig
+@@ -1004,6 +1004,16 @@
+ 	  This driver can also be built as a module.  If so, the module
+ 	  will be called i2c-qup.
+ 
++config I2C_RDA
++	tristate "RDA Micro RDA8810PL I2C adapter"
++	depends on ARCH_RDA || COMPILE_TEST
++	help
++	  If you say yes to this option, support will be included for the
++	  RDA Micro RDA8810PL I2C master controller (PIO, polled).
++
++	  This driver can also be built as a module. If so, the module
++	  will be called i2c-rda.
++
+ config I2C_RIIC
+ 	tristate "Renesas RIIC adapter"
+ 	depends on ARCH_RENESAS || COMPILE_TEST
+diff --git a/drivers/i2c/busses/Makefile b/drivers/i2c/busses/Makefile
+--- a/drivers/i2c/busses/Makefile
++++ b/drivers/i2c/busses/Makefile
+@@ -99,6 +99,7 @@
+ obj-$(CONFIG_I2C_QCOM_GENI)	+= i2c-qcom-geni.o
+ obj-$(CONFIG_I2C_QUP)		+= i2c-qup.o
+ obj-$(CONFIG_I2C_RIIC)		+= i2c-riic.o
++obj-$(CONFIG_I2C_RDA)		+= i2c-rda.o
+ obj-$(CONFIG_I2C_RK3X)		+= i2c-rk3x.o
+ obj-$(CONFIG_I2C_RZV2M)		+= i2c-rzv2m.o
+ obj-$(CONFIG_I2C_S3C2410)	+= i2c-s3c2410.o
+diff --git a/drivers/i2c/busses/i2c-rda.c b/drivers/i2c/busses/i2c-rda.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/i2c/busses/i2c-rda.c
+@@ -0,0 +1,285 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * RDA Micro RDA8810PL I2C master controller driver (PIO, polled).
++ *
++ * Forward-port of the vendor 3.10 i2c-rda.c (OrangePiLibra/OrangePi_i96_kernel)
++ * to the modern I2C and DT frameworks. The controller is a simple byte-level
++ * engine: one CMD register issues START/WRITE/READ/STOP/ACK phases and the
++ * IRQ_STATUS bit is polled for phase completion (the vendor driver never used
++ * the interrupt either).
++ *
++ * Copyright RDA Microelectronics Company Limited
++ */
++
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/err.h>
++#include <linux/i2c.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++
++#define REG_CTRL		0x00
++#define REG_STATUS		0x04
++#define REG_TXRX_BUFFER		0x08
++#define REG_CMD			0x0c
++#define REG_IRQ_CLR		0x10
++
++/* CTRL */
++#define CTRL_EN			BIT(0)
++#define CTRL_IRQ_MASK		BIT(8)
++#define CTRL_PRESCALE(n)	(((n) & 0xffff) << 16)
++
++/* STATUS */
++#define STATUS_IRQ_CAUSE	BIT(0)
++#define STATUS_IRQ_STATUS	BIT(4)
++#define STATUS_TIP		BIT(8)
++#define STATUS_AL		BIT(12)
++#define STATUS_BUSY		BIT(16)
++#define STATUS_RXACK		BIT(20)
++
++/* CMD */
++#define CMD_ACK			BIT(0)
++#define CMD_RD			BIT(4)
++#define CMD_STO			BIT(8)
++#define CMD_WR			BIT(12)
++#define CMD_STA			BIT(16)
++
++/* IRQ_CLR */
++#define IRQ_CLR_BIT		BIT(0)
++
++#define RDA_I2C_TIMEOUT_US	(100 * USEC_PER_MSEC)
++
++struct rda_i2c_dev {
++	struct device *dev;
++	void __iomem *base;
++	struct clk *clk;
++	u32 bus_freq;
++	struct i2c_adapter adapter;
++};
++
++static int rda_i2c_wait_done(struct rda_i2c_dev *i2c)
++{
++	u32 status;
++
++	return readl_poll_timeout(i2c->base + REG_STATUS, status,
++				  status & STATUS_IRQ_STATUS, 40,
++				  RDA_I2C_TIMEOUT_US);
++}
++
++static int rda_i2c_stop(struct rda_i2c_dev *i2c)
++{
++	int ret;
++
++	writel(CMD_STO, i2c->base + REG_CMD);
++	ret = rda_i2c_wait_done(i2c);
++	if (ret) {
++		dev_dbg(i2c->dev, "timeout waiting for STOP\n");
++		return ret;
++	}
++	writel(IRQ_CLR_BIT, i2c->base + REG_IRQ_CLR);
++	return 0;
++}
++
++static int rda_i2c_send_byte(struct rda_i2c_dev *i2c, u8 data, bool start,
++			     bool stop)
++{
++	u32 cmd = CMD_WR, status;
++	int ret;
++
++	if (start)
++		cmd |= CMD_STA;
++	if (stop)
++		cmd |= CMD_STO;
++
++	writel(data, i2c->base + REG_TXRX_BUFFER);
++	writel(cmd, i2c->base + REG_CMD);
++
++	ret = rda_i2c_wait_done(i2c);
++	if (ret) {
++		writel(CMD_STO, i2c->base + REG_CMD);
++		return ret;
++	}
++	writel(IRQ_CLR_BIT, i2c->base + REG_IRQ_CLR);
++
++	/* Wait for the slave ACK (RXACK clears). */
++	ret = readl_poll_timeout(i2c->base + REG_STATUS, status,
++				 !(status & STATUS_RXACK), 40,
++				 RDA_I2C_TIMEOUT_US);
++	if (ret) {
++		rda_i2c_stop(i2c);
++		return -ENXIO;	/* NAK */
++	}
++	return 0;
++}
++
++static int rda_i2c_get_byte(struct rda_i2c_dev *i2c, u8 *data, bool stop)
++{
++	u32 cmd = CMD_RD;
++	int ret;
++
++	if (stop)
++		cmd |= CMD_ACK | CMD_STO;	/* NAK the last byte + STOP */
++
++	writel(cmd, i2c->base + REG_CMD);
++
++	ret = rda_i2c_wait_done(i2c);
++	if (ret) {
++		writel(CMD_STO, i2c->base + REG_CMD);
++		return ret;
++	}
++	writel(IRQ_CLR_BIT, i2c->base + REG_IRQ_CLR);
++
++	*data = readl(i2c->base + REG_TXRX_BUFFER) & 0xff;
++	return 0;
++}
++
++static int rda_i2c_xfer_msg(struct rda_i2c_dev *i2c, struct i2c_msg *msg,
++			    bool stop)
++{
++	int i, ret;
++
++	if (msg->len < 1)
++		return -EINVAL;
++
++	if (msg->flags & I2C_M_RD) {
++		ret = rda_i2c_send_byte(i2c, (msg->addr << 1) | 0x01, true,
++					false);
++		if (ret)
++			return ret;
++		for (i = 0; i < msg->len; i++) {
++			ret = rda_i2c_get_byte(i2c, &msg->buf[i],
++					       stop && i == msg->len - 1);
++			if (ret)
++				return ret;
++		}
++	} else {
++		ret = rda_i2c_send_byte(i2c, (msg->addr << 1) & 0xfe, true,
++					false);
++		if (ret)
++			return ret;
++		for (i = 0; i < msg->len; i++) {
++			ret = rda_i2c_send_byte(i2c, msg->buf[i], false,
++						stop && i == msg->len - 1);
++			if (ret)
++				return ret;
++		}
++	}
++	return 0;
++}
++
++static int rda_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[],
++			int num)
++{
++	struct rda_i2c_dev *i2c = i2c_get_adapdata(adap);
++	int i, ret = 0;
++
++	for (i = 0; i < num; i++) {
++		ret = rda_i2c_xfer_msg(i2c, &msgs[i], i == num - 1);
++		if (ret) {
++			rda_i2c_stop(i2c);
++			return ret;
++		}
++	}
++	return num;
++}
++
++static u32 rda_i2c_func(struct i2c_adapter *adap)
++{
++	return I2C_FUNC_I2C | I2C_FUNC_SMBUS_EMUL;
++}
++
++static const struct i2c_algorithm rda_i2c_algo = {
++	.master_xfer	= rda_i2c_xfer,
++	.functionality	= rda_i2c_func,
++};
++
++static void rda_i2c_hw_init(struct rda_i2c_dev *i2c)
++{
++	unsigned long mclk = clk_get_rate(i2c->clk);
++	u32 div;
++
++	/* Vendor formula: prescale = ceil(mclk / (5 * bus_freq)) - 1 */
++	div = DIV_ROUND_UP(mclk, 5 * i2c->bus_freq);
++	if (div)
++		div--;
++	if (div > 0xffff)
++		div = 0xffff;
++
++	writel(CTRL_EN | CTRL_PRESCALE(div), i2c->base + REG_CTRL);
++
++	dev_dbg(i2c->dev, "mclk %lu, bus %u Hz, prescale %u\n", mclk,
++		i2c->bus_freq, div);
++}
++
++static int rda_i2c_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct rda_i2c_dev *i2c;
++	int ret;
++
++	i2c = devm_kzalloc(dev, sizeof(*i2c), GFP_KERNEL);
++	if (!i2c)
++		return -ENOMEM;
++
++	i2c->dev = dev;
++	i2c->base = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(i2c->base))
++		return PTR_ERR(i2c->base);
++
++	i2c->clk = devm_clk_get_enabled(dev, NULL);
++	if (IS_ERR(i2c->clk))
++		return dev_err_probe(dev, PTR_ERR(i2c->clk),
++				     "failed to get clock\n");
++
++	if (of_property_read_u32(dev->of_node, "clock-frequency",
++				 &i2c->bus_freq))
++		i2c->bus_freq = I2C_MAX_STANDARD_MODE_FREQ;
++
++	rda_i2c_hw_init(i2c);
++
++	i2c->adapter.owner = THIS_MODULE;
++	i2c->adapter.algo = &rda_i2c_algo;
++	i2c->adapter.retries = 3;
++	i2c->adapter.timeout = msecs_to_jiffies(100);
++	i2c->adapter.dev.parent = dev;
++	i2c->adapter.dev.of_node = dev->of_node;
++	snprintf(i2c->adapter.name, sizeof(i2c->adapter.name), "rda-i2c");
++	i2c_set_adapdata(&i2c->adapter, i2c);
++	platform_set_drvdata(pdev, i2c);
++
++	ret = i2c_add_adapter(&i2c->adapter);
++	if (ret)
++		return ret;
++
++	dev_info(dev, "RDA I2C adapter at %pa\n", &pdev->resource[0].start);
++	return 0;
++}
++
++static void rda_i2c_remove(struct platform_device *pdev)
++{
++	struct rda_i2c_dev *i2c = platform_get_drvdata(pdev);
++
++	i2c_del_adapter(&i2c->adapter);
++}
++
++static const struct of_device_id rda_i2c_dt_ids[] = {
++	{ .compatible = "rda,8810pl-i2c" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, rda_i2c_dt_ids);
++
++static struct platform_driver rda_i2c_driver = {
++	.probe = rda_i2c_probe,
++	.remove_new = rda_i2c_remove,
++	.driver = {
++		.name = "rda-i2c",
++		.of_match_table = rda_i2c_dt_ids,
++	},
++};
++module_platform_driver(rda_i2c_driver);
++
++MODULE_DESCRIPTION("RDA8810PL I2C bus adapter");
++MODULE_LICENSE("GPL");

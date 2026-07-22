@@ -1,0 +1,67 @@
+ARM: dts: unisoc: rda8810pl: add I2C controllers, enable i2c1 on the i96
+
+Three I2C masters at 0x20950000/0x20960000/0x20970000 (APB1 clock
+domain). i2c1 is bus 0 on the Orange Pi i96 and hosts the RDA599x
+WiFi/BT combo chip's control interface (wifi_core@0x13, wifi_rf@0x14,
+bt_core@0x15, bt_rf@0x16 per the vendor board files).
+
+Upstream-Status: Inappropriate [local forward-port pending proper upstream submission]
+
+Signed-off-by: Sergio Marin <sergio.marin@pantacor.com>
+---
+
+diff --git a/arch/arm/boot/dts/unisoc/rda8810pl.dtsi b/arch/arm/boot/dts/unisoc/rda8810pl.dtsi
+--- a/arch/arm/boot/dts/unisoc/rda8810pl.dtsi
++++ b/arch/arm/boot/dts/unisoc/rda8810pl.dtsi
+@@ -118,6 +118,36 @@ gpiod: gpiod@32000 {
+ 			#interrupt-cells = <2>;
+ 			interrupts = <14 IRQ_TYPE_LEVEL_HIGH>;
+ 		};
++
++		i2c1: i2c@50000 {
++			compatible = "rda,8810pl-i2c";
++			reg = <0x50000 0x1000>;
++			clocks = <&ap_syscon CLK_APB1>;
++			#address-cells = <1>;
++			#size-cells = <0>;
++			clock-frequency = <100000>;
++			status = "disabled";
++		};
++
++		i2c2: i2c@60000 {
++			compatible = "rda,8810pl-i2c";
++			reg = <0x60000 0x1000>;
++			clocks = <&ap_syscon CLK_APB1>;
++			#address-cells = <1>;
++			#size-cells = <0>;
++			clock-frequency = <100000>;
++			status = "disabled";
++		};
++
++		i2c3: i2c@70000 {
++			compatible = "rda,8810pl-i2c";
++			reg = <0x70000 0x1000>;
++			clocks = <&ap_syscon CLK_APB1>;
++			#address-cells = <1>;
++			#size-cells = <0>;
++			clock-frequency = <100000>;
++			status = "disabled";
++		};
+ 	};
+ 
+ 	apb@20a00000 {
+diff --git a/arch/arm/boot/dts/unisoc/rda8810pl-orangepi-i96.dts b/arch/arm/boot/dts/unisoc/rda8810pl-orangepi-i96.dts
+--- a/arch/arm/boot/dts/unisoc/rda8810pl-orangepi-i96.dts
++++ b/arch/arm/boot/dts/unisoc/rda8810pl-orangepi-i96.dts
+@@ -60,6 +60,11 @@
+ 	rda,mclk-inv;
+ };
+ 
++/* Bus 0: hosts the RDA599x WiFi/BT combo control interface. */
++&i2c1 {
++	status = "okay";
++};
++
+ &uart1 {
+ 	status = "okay";
+ 	clocks = <&uart_clk>;

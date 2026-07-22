@@ -1,0 +1,43 @@
+ARM: dts: unisoc: rda8810pl-orangepi-i96: pin CMA inside the IFC DMA window
+
+The IFC DMA engine addresses only the first 64 MB of DRAM (26-bit
+start_addr, offset from 0x80000000). Pin the default CMA pool inside
+that window so dma_alloc_coherent() users — in particular the rda-mmc
+bounce buffer — always land at a DMA-reachable address on this 256 MB
+board.
+
+Local backport addition to the "RDA8810PL SD/MMC support" series.
+
+Upstream-Status: Inappropriate [board-local workaround pending proper dma-ranges support]
+
+Signed-off-by: Sergio Marin <sergio.marin@pantacor.com>
+---
+
+--- a/arch/arm/boot/dts/unisoc/rda8810pl-orangepi-i96.dts
++++ b/arch/arm/boot/dts/unisoc/rda8810pl-orangepi-i96.dts
+@@ -28,6 +28,25 @@
+ 		reg = <0x80000000 0x10000000>;
+ 	};
+ 
++	reserved-memory {
++		#address-cells = <1>;
++		#size-cells = <1>;
++		ranges;
++
++		/*
++		 * The IFC DMA reaches only 0x80000000..0x83ffffff (26-bit
++		 * start_addr). Keep the default CMA pool inside that window
++		 * so coherent allocations (rda-mmc bounce) are reachable.
++		 */
++		linux,cma {
++			compatible = "shared-dma-pool";
++			reusable;
++			size = <0x2000000>;
++			alloc-ranges = <0x80000000 0x4000000>;
++			linux,cma-default;
++		};
++	};
++
+ 	vdd_sdmmc: regulator-fixed {
+ 		compatible = "regulator-fixed";
+ 		regulator-name = "vdd_sdmmc";

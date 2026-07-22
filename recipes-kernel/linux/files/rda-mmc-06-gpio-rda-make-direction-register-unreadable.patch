@@ -1,0 +1,30 @@
+gpio: rda: Make direction register unreadable
+
+The register doesn't like to be read and would cause all the input
+to be switched to output.
+
+This causes the SD Card Detect GPIO to misbehaves in the OS and/or
+may cause hardware to malfunction.
+
+Backported to 6.6 (bgpio_init() call style; upstream 6.17 uses
+gpio_generic_chip_init() with a config struct).
+
+Signed-off-by: Dang Huynh <dang.huynh@mainlining.org>
+
+Upstream-Status: Submitted [https://lore.kernel.org/all/20250919-rda8810pl-mmc-v1-9-d4f08a05ba4d@mainlining.org/]
+---
+ drivers/gpio/gpio-rda.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/gpio/gpio-rda.c b/drivers/gpio/gpio-rda.c
+--- a/drivers/gpio/gpio-rda.c
++++ b/drivers/gpio/gpio-rda.c
+@@ -241,7 +241,7 @@ static int rda_gpio_probe(struct platform_device *pdev)
+ 			 rda_gpio->base + RDA_GPIO_CLR,
+ 			 rda_gpio->base + RDA_GPIO_OEN_SET_OUT,
+ 			 rda_gpio->base + RDA_GPIO_OEN_SET_IN,
+-			 BGPIOF_READ_OUTPUT_REG_SET);
++			 BGPIOF_READ_OUTPUT_REG_SET | BGPIOF_UNREADABLE_REG_DIR);
+ 	if (ret) {
+ 		dev_err(dev, "bgpio_init failed\n");
+ 		return ret;

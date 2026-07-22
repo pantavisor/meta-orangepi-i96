@@ -1,0 +1,165 @@
+mmc: host: rda: bounce all data through a low-DRAM buffer
+
+The RDA IFC DMA start_addr register is only 26 bits wide: it addresses
+the first 64 MB of DRAM (0x80000000..0x83ffffff) as an offset from the
+DRAM base. On a 256 MB board, buffers above 0x84000000 get their address
+truncated and the DMA silently corrupts low kernel memory — observed as
+intermittent hard freezes during SD card init and sustained I/O on the
+Orange Pi i96 (bench-verified on the same silicon during u-boot bring-up,
+which uses the same bounce strategy for the same reason).
+
+Stage every data transfer through a 64 KB bounce buffer allocated with
+dmam_alloc_coherent(); the board DT pins default CMA inside the reachable
+window so the allocation is always valid. max_req_size is capped to the
+bounce size so the core never sends a larger request.
+
+Local backport addition to the "RDA8810PL SD/MMC support" series.
+
+Upstream-Status: Inappropriate [backport-local workaround; proper fix needs dma-ranges support in the series]
+
+Signed-off-by: Sergio Marin <sergio.marin@pantacor.com>
+---
+
+--- a/drivers/mmc/host/rda-mmc.c
++++ b/drivers/mmc/host/rda-mmc.c
+@@ -23,6 +23,7 @@
+ #include <linux/reset.h>
+ #include <linux/debugfs.h>
+ #include <linux/scatterlist.h>
++#include <linux/sizes.h>
+ #include <linux/spinlock.h>
+ 
+ /* Registers Definitions */
+@@ -87,6 +88,8 @@
+ #define SDMMC_MCLK_INVERT BIT(4)
+ #define SDMMC_MCLK_DISABLE BIT(5)
+ 
++#define RDA_MMC_BOUNCE_SIZE SZ_64K
++
+ struct rda_mmc_host {
+ 	struct device *dev;
+ 
+@@ -108,6 +111,17 @@
+ 	struct dma_chan *dma_tx;
+ 	struct dma_chan *dma_rx;
+ 
++	/*
++	 * The IFC DMA start_addr register is only 26 bits wide: it can address
++	 * just the first 64 MB of DRAM (0x80000000..0x83ffffff) as an offset
++	 * from the DRAM base. Any buffer above that window gets its address
++	 * truncated and the DMA silently corrupts low memory. All data is
++	 * therefore staged through a bounce buffer allocated from CMA, which
++	 * the DT pins inside the reachable window.
++	 */
++	void *bounce;
++	dma_addr_t bounce_dma;
++
+ 	bool sdio_irq;
+ 	bool sdio_irq_trigger;
+ 
+@@ -213,39 +227,41 @@
+ 		slave_config.direction = DMA_DEV_TO_MEM;
+ 	}
+ 
+-	data->sg_count = dma_map_sg(dev, data->sg, data->sg_len, mmc_get_dma_dir(data));
+-	if (data->sg_count == 0) {
+-		ret = -ENOMEM;
++	/* Stage through the low-DRAM bounce (see struct comment). */
++	if (WARN_ON(data->blocks * data->blksz > RDA_MMC_BOUNCE_SIZE)) {
++		ret = -EINVAL;
+ 		goto fail;
+ 	}
++	if (data->flags & MMC_DATA_WRITE)
++		sg_copy_to_buffer(data->sg, data->sg_len, priv->bounce,
++				  data->blocks * data->blksz);
+ 
+ 	chan = rda_mmc_get_dma_chan(priv, data);
+ 
+ 	ret = dmaengine_slave_config(chan, &slave_config);
+ 	if (ret) {
+ 		dev_err(dev, "Failed to configure DMAC\n");
+-		goto fail_dma;
++		goto fail;
+ 	}
+ 
+-	desc = dmaengine_prep_slave_sg(chan, data->sg, data->sg_count,
++	desc = dmaengine_prep_slave_single(chan, priv->bounce_dma,
++			data->blocks * data->blksz,
+ 			slave_config.direction, DMA_CTRL_ACK);
+ 	if (!desc) {
+ 		dev_err(dev, "Failed to allocate DMA descriptor\n");
+-		goto fail_dma;
++		goto fail;
+ 	}
+ 
+ 	priv->dma_cookie = dmaengine_submit(desc);
+ 	if (!priv->dma_cookie) {
+ 		dev_err(dev, "Failed to submit DMA request\n");
+-		goto fail_dma;
++		goto fail;
+ 	}
+ 
+ 	dma_async_issue_pending(chan);
+ 
+ 	return 0;
+ 
+-fail_dma:
+-	dma_unmap_sg(dev, data->sg, data->sg_len, mmc_get_dma_dir(data));
+ fail:
+ 	return -EINVAL;
+ }
+@@ -425,9 +441,6 @@
+ 			spin_lock_irqsave(&priv->lock, flags);
+ 			priv->mrq = NULL;
+ 
+-			dma_unmap_sg(dev, data->sg, data->sg_len,
+-					mmc_get_dma_dir(data));
+-
+ 			chan = rda_mmc_get_dma_chan(priv, data);
+ 
+ 			dmaengine_terminate_sync(chan);
+@@ -642,12 +655,16 @@
+ 			}
+ 		}
+ 
++		/* Successful read: copy the bounce out to the caller. */
++		if (!mrq->data->error && (mrq->data->flags & MMC_DATA_READ))
++			sg_copy_from_buffer(mrq->data->sg, mrq->data->sg_len,
++					    priv->bounce,
++					    mrq->data->bytes_xfered);
++
+ 		/*
+ 		 * Since we told the controller to automatically send a stop command,
+ 		 * we don't have to send a stop command here.
+ 		 */
+-		dma_unmap_sg(dev, mrq->data->sg, mrq->data->sg_len,
+-				mmc_get_dma_dir(mrq->data));
+ 		dmaengine_terminate_sync(chan);
+ 	}
+ 
+@@ -776,11 +793,22 @@
+ 
+ 	mmc->ops = &rda_mmc_ops;
+ 
++	priv->bounce = dmam_alloc_coherent(dev, RDA_MMC_BOUNCE_SIZE,
++					   &priv->bounce_dma, GFP_KERNEL);
++	if (!priv->bounce) {
++		ret = -ENOMEM;
++		goto fail_release_dma;
++	}
++	if (priv->bounce_dma < 0x80000000 ||
++	    priv->bounce_dma + RDA_MMC_BOUNCE_SIZE > 0x84000000)
++		dev_warn(dev, "bounce @%pad outside the 64MB IFC DMA window\n",
++			 &priv->bounce_dma);
++
+ 	mmc->max_segs = 1;
+ 	mmc->max_blk_size = 4096;
+-	mmc->max_blk_count = 0xFFFF;
+-	mmc->max_req_size = 0xFFFF;
+-	mmc->max_seg_size = 0xFFFF;
++	mmc->max_blk_count = RDA_MMC_BOUNCE_SIZE / 512;
++	mmc->max_req_size = RDA_MMC_BOUNCE_SIZE;
++	mmc->max_seg_size = RDA_MMC_BOUNCE_SIZE;
+ 
+ 	mmc->f_min = 1000000;
+ 	mmc->caps = MMC_CAP_4_BIT_DATA;

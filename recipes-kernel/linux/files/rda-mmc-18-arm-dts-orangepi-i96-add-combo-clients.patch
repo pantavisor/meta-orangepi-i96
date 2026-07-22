@@ -1,0 +1,40 @@
+ARM: dts: unisoc: rda8810pl-orangepi-i96: add RDA599x combo I2C clients
+
+The WiFi/BT combo chip's four control interfaces on i2c1 (bus 0),
+addresses from the vendor board files.
+
+Upstream-Status: Inappropriate [board bring-up]
+
+Signed-off-by: Sergio Marin <sergio.marin@pantacor.com>
+---
+
+diff --git a/arch/arm/boot/dts/unisoc/rda8810pl-orangepi-i96.dts b/arch/arm/boot/dts/unisoc/rda8810pl-orangepi-i96.dts
+--- a/arch/arm/boot/dts/unisoc/rda8810pl-orangepi-i96.dts
++++ b/arch/arm/boot/dts/unisoc/rda8810pl-orangepi-i96.dts
+@@ -63,6 +63,26 @@
+ /* Bus 0: hosts the RDA599x WiFi/BT combo control interface. */
+ &i2c1 {
+ 	status = "okay";
++
++	wifi_core: wifi@13 {
++		compatible = "rda,wifi-core-i2c";
++		reg = <0x13>;
++	};
++
++	wifi_rf: wifi@14 {
++		compatible = "rda,wifi-rf-i2c";
++		reg = <0x14>;
++	};
++
++	bt_core: bluetooth@15 {
++		compatible = "rda,bt-core-i2c";
++		reg = <0x15>;
++	};
++
++	bt_rf: bluetooth@16 {
++		compatible = "rda,bt-rf-i2c";
++		reg = <0x16>;
++	};
+ };
+ 
+ &uart1 {
