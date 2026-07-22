@@ -1,0 +1,17 @@
+# OrangePi i96 (RDA8810PL) SD-card layout — mirrors the vendor Debian image:
+#   - bootloader blob (vendor SPL + modern u-boot stage-2) raw in the 2 MB gap,
+#     SPL @ 0x20000 (see package-bootloader.sh / mkrdaimage layout)
+#   - ext boot partition (boot.scr, kernel/FIT, pantavisor boot files)  @ 2 MB
+#   - ext4 rootfs (pantavisor) on p2  -> root=/dev/mmcblk0p2
+#
+# bootloader.rda must be built first (M3) and placed in DEPLOY_DIR_IMAGE.
+# RDA8810 BootROM loads the SPL from a raw SD offset; there is no MBR bootcode
+# dependency, so a normal msdos table is fine (p1 starts at 2 MB, leaving the gap).
+
+part --source rawcopy --sourceparams="file=bootloader.rda" --no-table --offset 128K
+
+part /boot --source bootimg-partition --fstype=ext4 --label boot --offset 2048K --size 50M --align 2048
+
+part / --source rootfs --fstype=ext4 --label rootfs --align 2048
+
+bootloader --ptable msdos

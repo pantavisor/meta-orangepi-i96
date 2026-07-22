@@ -1,0 +1,15 @@
+if ARCH_RDA
+
+config SYS_SOC
+	default "rda"
+
+config SYS_BOARD
+	default "rda8810pl"
+
+config SYS_VENDOR
+	default "rda"
+
+config SYS_CONFIG_NAME
+	default "rda8810pl"
+
+endif

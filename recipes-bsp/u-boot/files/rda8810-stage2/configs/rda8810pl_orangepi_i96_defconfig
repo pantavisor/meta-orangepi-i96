@@ -1,0 +1,75 @@
+# OrangePi i96 (RDA8810PL) modern u-boot STAGE-2 — loaded by the vendor SPL.
+# DDR/clock already initialised by SPL; stage-2 = console + MMC + pantavisor cmds.
+CONFIG_ARM=y
+CONFIG_ARCH_RDA=y
+# NO ARM generic timer on RDA8810PL (Cortex-A5): the mainline DT has only
+# rda,8810pl-timer, no arm,armv7-timer. CONFIG_SYS_ARCH_TIMER makes timer_init
+# touch the nonexistent generic-timer CP15 regs -> undefined-instruction hang
+# right after initf_dm. Use the SoC HWTIMER via the DM timer (drivers/timer/rda_timer.c).
+CONFIG_TIMER=y
+CONFIG_RDA_TIMER=y
+# Vendor SPL loads stage-2 here (rda_config_defaults.h CONFIG_SYS_TEXT_BASE) + 0x40 hdr.
+CONFIG_TEXT_BASE=0x80008000
+CONFIG_SYS_MALLOC_LEN=0x1010000
+CONFIG_NR_DRAM_BANKS=1
+CONFIG_SYS_LOAD_ADDR=0x82000000
+CONFIG_DEFAULT_DEVICE_TREE="rda8810pl-orangepi-i96"
+CONFIG_OF_CONTROL=y
+CONFIG_DM=y
+
+# --- console (this port's serial_rda.c; uart3 @ 0x20a90000, 921600) ---
+CONFIG_DM_SERIAL=y
+CONFIG_RDA_SERIAL=y
+CONFIG_BAUDRATE=921600
+
+# --- early debug UART (bring-up): direct writes to uart3 from arch_cpu_init,
+#     before DM/console. "<debug_uart>" on the wire == stage-2 is executing. ---
+CONFIG_DEBUG_UART=y
+CONFIG_DEBUG_UART_RDA=y
+CONFIG_DEBUG_UART_BASE=0x20a90000
+CONFIG_DEBUG_UART_CLOCK=921600
+CONFIG_DEBUG_UART_ANNOUNCE=y
+
+# --- SD (this port's rda_mmc.c; SDMMC1 @ 0x20A50000) ---
+CONFIG_MMC=y
+CONFIG_DM_MMC=y
+CONFIG_RDA_MMC=y
+CONFIG_CMD_MMC=y
+CONFIG_DOS_PARTITION=y
+CONFIG_CMD_PART=y
+
+# --- filesystems: read kernel/FIT + pantavisor pv.env from ext boot part ---
+CONFIG_FS_EXT4=y
+CONFIG_CMD_EXT4=y
+CONFIG_CMD_EXT2=y
+CONFIG_CMD_FAT=y
+CONFIG_CMD_FS_GENERIC=y
+
+# --- boot formats ---
+CONFIG_FIT=y
+CONFIG_LEGACY_IMAGE_FORMAT=y
+CONFIG_CMD_BOOTZ=y
+CONFIG_SUPPORT_RAW_INITRD=y
+
+# --- pantavisor boot.cmd.pvgeneric REQUIRES these (the whole reason for stage-2) ---
+# hush shell: comments, &&/||, if/test — the pvgeneric script is full of them
+# (the simple parser dies on the first '#' line).
+CONFIG_HUSH_PARSER=y
+CONFIG_CMD_SETEXPR=y
+CONFIG_CMD_FDT=y
+CONFIG_CMD_SOURCE=y
+CONFIG_CMD_ENV_EXISTS=y
+CONFIG_CMD_IMPORTENV=y
+CONFIG_CMD_EXPORTENV=y
+CONFIG_CMD_SAVEENV=y
+
+# --- env: pantavisor keeps pv.env as a file on the ext boot partition (mmc 0:1) ---
+CONFIG_ENV_IS_IN_EXT4=y
+CONFIG_ENV_EXT4_INTERFACE="mmc"
+CONFIG_ENV_EXT4_DEVICE_AND_PART="0:1"
+CONFIG_ENV_EXT4_FILE="/uboot.env"
+
+CONFIG_BOOTDELAY=1
+# default bootcmd mirrors the vendor: load + source boot.scr from the boot partition
+CONFIG_USE_BOOTCOMMAND=y
+CONFIG_BOOTCOMMAND="mmc dev 0; load mmc 0:1 ${loadaddr} boot.scr && source ${loadaddr}"

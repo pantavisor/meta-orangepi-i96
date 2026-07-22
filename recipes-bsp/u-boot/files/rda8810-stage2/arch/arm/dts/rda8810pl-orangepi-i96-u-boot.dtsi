@@ -1,0 +1,26 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/* u-boot additions: pre-reloc console + the SD/MMC node mainline lacks.
+ * SDMMC1 @ 0x20a50000 sits on the apb@20a00000 bus (offset 0x50000). */
+
+&uart3 {
+	bootph-all;
+};
+
+/* SoC HWTIMER: u-boot's timebase (no ARM generic timer on this SoC). Needs to be
+ * available pre-relocation so udelay()/get_timer() work during board_init_f. */
+&{/apb@20900000/timer@10000} {
+	bootph-all;
+};
+
+/* SD/MMC: re-enabled now that the console + timer are up (the earlier hang was
+ * the arch timer, not MMC). Binds/probes post-relocation, which is all bootcmd
+ * needs to load the kernel from the boot partition. No bootph-all: MMC is not
+ * needed pre-reloc. rda_mmc's data path is still bench-unvalidated. */
+&{/apb@20a00000} {
+	mmc0: mmc@50000 {
+		compatible = "rda,8810-mmc";
+		reg = <0x50000 0x1000>;
+		bus-width = <4>;
+		status = "okay";
+	};
+};
