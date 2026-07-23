@@ -1,0 +1,50 @@
+mmc: host: rda: report a missing response as a timeout
+
+SDMMC_STATUS_NO_RSP_ERR means the card never answered the command, but
+rda_mmc_recv_resp() returned without setting cmd->error. The core then
+treats the command as successful and reads cmd->resp[], which is still
+zero.
+
+For SDIO that produces a badly misleading diagnosis. mmc_attach_sdio()
+sends CMD5 (IO_SEND_OP_COND) and uses resp[0] as the card's OCR; a zero
+OCR makes mmc_select_voltage() print
+
+    mmc1: no support for card's volts
+    mmc1: error -22 whilst initialising SDIO card
+
+which reads as a voltage-range mismatch when in fact nothing responded at
+all. The host's ocr_avail already matches the vendor's SDIO host exactly
+(MMC_VDD_32_33 | MMC_VDD_33_34, devices.c rda_mmc1_data), so the voltage
+was never the problem.
+
+Set -ETIMEDOUT when a response was expected and none arrived.
+
+Upstream-Status: Inappropriate [local forward-port pending proper upstream submission]
+
+Signed-off-by: Sergio Marin <sergio.marin@pantacor.com>
+---
+
+diff --git a/drivers/mmc/host/rda-mmc.c b/drivers/mmc/host/rda-mmc.c
+--- a/drivers/mmc/host/rda-mmc.c
++++ b/drivers/mmc/host/rda-mmc.c
+@@ -175,8 +175,19 @@
+ 		return;
+ 	}
+ 
+-	if (status & SDMMC_STATUS_NO_RSP_ERR)
++	if (status & SDMMC_STATUS_NO_RSP_ERR) {
++		/*
++		 * No response at all. Returning success here leaves cmd->resp[]
++		 * zeroed and the core reads that as a valid answer -- for CMD5
++		 * (SDIO IO_SEND_OP_COND) a zero OCR comes back out of
++		 * mmc_select_voltage() as the thoroughly misleading
++		 * "no support for card's volts" instead of "the card never
++		 * answered". A missing response is a timeout; say so.
++		 */
++		if (mmc_resp_type(cmd) != MMC_RSP_NONE)
++			cmd->error = -ETIMEDOUT;
+ 		return;
++	}
+ 
+ 	if (status & SDMMC_STATUS_RSP_ERR) {
+ 		cmd->error = -EILSEQ;

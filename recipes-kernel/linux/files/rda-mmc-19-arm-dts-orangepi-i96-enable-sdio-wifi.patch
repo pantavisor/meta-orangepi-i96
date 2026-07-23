@@ -1,0 +1,50 @@
+ARM: dts: unisoc: rda8810pl-orangepi-i96: enable SDMMC2 for the WiFi SDIO
+
+The RDA5991_G combo chip's data path is SDIO on SDMMC2 (mmc@60000). Its
+control interface on i2c1 is already up (patches 15-18) and reports
+project_id 0x5991 / chip_version 0x47, so the remaining piece for a
+network interface is the SDIO host plus the rdawlan driver.
+
+Board parameters from the vendor tgt_ap_board_config.h: 20 MHz maximum,
+mclk inverted, mclk adjust 3. The chip is soldered down, so the host is
+non-removable with no card-detect line, and it uses the SDIO interrupt
+that rda_mmc already implements (enable_sdio_irq).
+
+Note this only works if the SDMMC2 pads are muxed off the GPIO block:
+BB_GPIO_Mode (0x11a09008) bits 15..20 must be clear. u-boot does that in
+board_init() -- see recipes-bsp/u-boot/files/rda8810-stage2/board/rda/
+rda8810pl/rda_combo.c. There is no RDA pinctrl driver in mainline, so
+without the bootloader the host enumerates nothing at all, which looks
+exactly like an absent chip. Same trap that hid the I2C1 problem; see
+MODEM-WIFI-PORT.md section 10.
+
+Upstream-Status: Inappropriate [board bring-up]
+
+Signed-off-by: Sergio Marin <sergio.marin@pantacor.com>
+---
+
+diff --git a/arch/arm/boot/dts/unisoc/rda8810pl-orangepi-i96.dts b/arch/arm/boot/dts/unisoc/rda8810pl-orangepi-i96.dts
+--- a/arch/arm/boot/dts/unisoc/rda8810pl-orangepi-i96.dts
++++ b/arch/arm/boot/dts/unisoc/rda8810pl-orangepi-i96.dts
+@@ -60,6 +60,21 @@
+ 	rda,mclk-inv;
+ };
+ 
++/*
++ * SDIO to the RDA5991_G WiFi/BT combo. Soldered down: no card detect, never
++ * removed. Vendor board parameters (tgt_ap_board_config.h): 20 MHz, mclk
++ * inverted, mclk adjust 3.
++ */
++&mmc2 {
++	status = "okay";
++	bus-width = <4>;
++	max-frequency = <20000000>;
++	non-removable;
++	cap-sdio-irq;
++	rda,mclk-adj = /bits/ 8 <3>;
++	rda,mclk-inv;
++};
++
+ /* Bus 0: hosts the RDA599x WiFi/BT combo control interface. */
+ &i2c1 {
+ 	status = "okay";

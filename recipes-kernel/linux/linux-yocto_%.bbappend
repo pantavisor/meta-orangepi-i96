@@ -39,4 +39,7 @@ SRC_URI:append:orangepi-i96 = " \
     file://rda-mmc-16-arm-dts-rda8810pl-add-i2c.patch \
     file://rda-mmc-17-wifi-add-rda-combo-power-controller.patch \
     file://rda-mmc-18-arm-dts-orangepi-i96-add-combo-clients.patch \
+    file://rda-mmc-19-arm-dts-orangepi-i96-enable-sdio-wifi.patch \
+    file://rda-mmc-20-mmc-rda-report-a-missing-response-as-a-timeout.patch \
+    file://rda-mmc-21-mmc-rda-fix-drvdata-type-confusion-in-remove.patch \
 "

@@ -1,0 +1,51 @@
+mmc: host: rda: fix drvdata type confusion in remove
+
+rda_mmc_probe() stores the struct mmc_host in the platform drvdata:
+
+	platform_set_drvdata(pdev, mmc);
+
+but rda_mmc_remove() reads it back as a struct rda_mmc_host and
+dereferences ->mmc on it. The two types are unrelated, so the load comes
+from a garbage offset inside mmc_host and mmc_remove_host() is handed a
+NULL:
+
+    Unable to handle kernel NULL pointer dereference at virtual address 00000264
+    PC is at mmc_stop_host+0x8/0xe4
+     mmc_stop_host from mmc_remove_host+0xc/0x28
+     mmc_remove_host from rda_mmc_remove+0x10/0x24
+     rda_mmc_remove from platform_remove+0x20/0x5c
+     platform_remove from device_release_driver_internal+0x184/0x1f8
+     unbind_store from kernfs_fop_write_iter+0x10c/0x1f8
+
+Reproducible on any instance with
+
+    echo 20a60000.mmc > /sys/bus/platform/drivers/rda-mmc/unbind
+
+Take the mmc_host back out of drvdata as stored and reach the private
+data through mmc_priv().
+
+Upstream-Status: Inappropriate [local forward-port pending proper upstream submission]
+
+Signed-off-by: Sergio Marin <sergio.marin@pantacor.com>
+---
+
+diff --git a/drivers/mmc/host/rda-mmc.c b/drivers/mmc/host/rda-mmc.c
+--- a/drivers/mmc/host/rda-mmc.c
++++ b/drivers/mmc/host/rda-mmc.c
+@@ -871,11 +871,12 @@
+ 
+ static void rda_mmc_remove(struct platform_device *pdev)
+ {
+-	struct rda_mmc_host *host = platform_get_drvdata(pdev);
++	struct mmc_host *mmc = platform_get_drvdata(pdev);
++	struct rda_mmc_host *priv = mmc_priv(mmc);
+ 
+-	mmc_remove_host(host->mmc);
+-	dma_release_channel(host->dma_rx);
+-	dma_release_channel(host->dma_tx);
++	mmc_remove_host(mmc);
++	dma_release_channel(priv->dma_rx);
++	dma_release_channel(priv->dma_tx);
+ }
+ 
+ static const struct of_device_id rda_mmc_dt_ids[] = {
