@@ -34,6 +34,33 @@
 	};
 };
 
+/* Bus 0: the RDA599x WiFi/BT combo control interface. u-boot only ever talks to
+ * wifi_rf@14 (the chip id lives there); the other three are listed so a plain
+ * "i2c probe" shows the whole combo. */
+&i2c1 {
+	status = "okay";
+
+	wifi_core: wifi@13 {
+		compatible = "rda,wifi-core-i2c";
+		reg = <0x13>;
+	};
+
+	wifi_rf: wifi@14 {
+		compatible = "rda,wifi-rf-i2c";
+		reg = <0x14>;
+	};
+
+	bt_core: bluetooth@15 {
+		compatible = "rda,bt-core-i2c";
+		reg = <0x15>;
+	};
+
+	bt_rf: bluetooth@16 {
+		compatible = "rda,bt-rf-i2c";
+		reg = <0x16>;
+	};
+};
+
 &uart1 {
 	status = "okay";
 	clocks = <&uart_clk>;

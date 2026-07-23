@@ -12,4 +12,14 @@ config SYS_VENDOR
 config SYS_CONFIG_NAME
 	default "rda8810pl"
 
+config RDA_ISPI
+	bool "RDA8810PL internal SPI (ISPI) transport"
+	help
+	  The ISPI is how the SoC reaches its analog blocks: port 0 is the AP's
+	  own baseband (PLLs), port 1 is the PMU that holds every v_* LDO and
+	  the low-frequency clock outputs. Under the vendor system the modem
+	  coprocessor owns port 1; with no modem running, u-boot does.
+
+source "board/rda/rda8810pl/Kconfig"
+
 endif

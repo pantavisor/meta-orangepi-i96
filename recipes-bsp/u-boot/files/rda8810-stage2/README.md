@@ -11,6 +11,17 @@ Build: `make rda8810pl_orangepi_i96_defconfig && make CROSS_COMPILE=arm-linux-gn
 Bench-gated only: rda_mmc.c data path (PIO attempt; vendor uses IFC DMA), set_ios clock
 divider, console UART confirmation, and the SPL->stage-2 handoff on real silicon (M5).
 
+Also here, and equally bench-gated: the **WiFi/BT combo power bring-up**
+(`arch/arm/mach-rda/rda_ispi.c`, `drivers/i2c/rda_i2c.c`,
+`board/rda/rda8810pl/rda_combo.c`). This is strategy A' of
+`../../../../recipes-kernel/linux/files/MODEM-WIFI-PORT.md`: reach the PMU over ISPI —
+which we can, because no modem firmware runs to contend for it — switch the RDA5991_G's
+supply on, and leave it latched so Linux never needs the mdcom/msys stack. The
+`rdapmu` and `rdacombo` commands make finding the (undocumented) PMU enable bit a
+sub-second loop at the u-boot prompt instead of a Linux boot per attempt. See §9 of
+that document for the bench procedure; `CONFIG_RDA_COMBO_POWER_AUTO` stays off until
+the bit is confirmed.
+
 ---
 
 

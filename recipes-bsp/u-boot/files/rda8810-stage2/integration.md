@@ -7,8 +7,11 @@ recipe `../../u-boot-orangepi-i96_2024.01.bb` automates this.
 ## Files to drop in (as-is)
     drivers/serial/serial_rda.c
     drivers/mmc/rda_mmc.c
-    arch/arm/mach-rda/{Kconfig,Makefile,soc.c}
-    board/rda/rda8810pl/{Kconfig,Makefile,board.c}
+    drivers/timer/rda_timer.c
+    drivers/i2c/rda_i2c.c
+    arch/arm/mach-rda/{Kconfig,Makefile,soc.c,rda_ispi.c}
+    arch/arm/include/asm/arch-rda/rda_ispi.h
+    board/rda/rda8810pl/{Kconfig,Makefile,board.c,rda_combo.c,rda_combo.h}
     include/configs/rda8810pl.h
     configs/rda8810pl_orangepi_i96_defconfig
     arch/arm/dts/rda8810pl-orangepi-i96-u-boot.dtsi
@@ -40,6 +43,24 @@ and add `dtb-$(CONFIG_ARCH_RDA) += rda8810pl-orangepi-i96.dtb` to arch/arm/dts/M
                depends on DM_MMC
    drivers/mmc/Makefile — add:
        obj-$(CONFIG_RDA_MMC) += rda_mmc.o
+
+4. drivers/i2c/Kconfig — add:
+       config RDA_I2C
+               bool "RDA Micro RDA8810PL I2C"
+               depends on DM_I2C
+   drivers/i2c/Makefile — add:
+       obj-$(CONFIG_RDA_I2C) += rda_i2c.o
+
+   (`RDA_ISPI` and `RDA_COMBO_POWER[_AUTO]` need no hooks: they live in
+   arch/arm/mach-rda/Kconfig and board/rda/rda8810pl/Kconfig, which are ours,
+   and mach-rda/Kconfig sources the board one.)
+
+5. drivers/timer/Kconfig — add:
+       config RDA_TIMER
+               bool "RDA Micro RDA8810PL HWTIMER"
+               depends on TIMER
+   drivers/timer/Makefile — add:
+       obj-$(CONFIG_RDA_TIMER) += rda_timer.o
 
 ## Build
     make rda8810pl_orangepi_i96_defconfig

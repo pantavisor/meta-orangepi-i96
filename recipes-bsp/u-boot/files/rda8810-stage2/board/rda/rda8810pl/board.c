@@ -7,6 +7,7 @@
 #include <init.h>
 #include <asm/global_data.h>
 #include <linux/sizes.h>
+#include "rda_combo.h"
 
 DECLARE_GLOBAL_DATA_PTR;
 
@@ -30,5 +31,12 @@ int board_init(void)
 {
 	/* boot params / FDT default address inside DRAM */
 	gd->bd->bi_boot_params = RDA_DRAM_BASE + 0x100;
+
+	/* Switch the WiFi/BT combo chip's PMU rail on and leave it latched, so
+	 * Linux inherits a powered chip instead of needing the modem stack.
+	 * Off by default until the bench pins the PMU bit — see rda_combo.c. */
+	if (IS_ENABLED(CONFIG_RDA_COMBO_POWER_AUTO))
+		rda_combo_power_latch(false);
+
 	return 0;
 }

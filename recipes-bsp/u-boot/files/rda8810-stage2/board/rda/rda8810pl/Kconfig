@@ -1,1 +1,29 @@
-# board options for OrangePi i96 (RDA8810PL) — none beyond mach-rda defaults
+# board options for OrangePi i96 (RDA8810PL)
+
+if ARCH_RDA
+
+config RDA_COMBO_POWER
+	bool "RDA599x WiFi/BT combo power bring-up (rdacombo/rdapmu commands)"
+	depends on DM_I2C
+	select RDA_ISPI
+	help
+	  Build the "rdacombo" and "rdapmu" commands, which reach the SoC's PMU
+	  over ISPI and try to switch on the RDA5991_G WiFi/BT combo chip that
+	  the modem coprocessor normally powers. This is the strategy-A' bench
+	  instrument described in recipes-kernel/linux/files/MODEM-WIFI-PORT.md;
+	  it costs a couple of KB and gives an in-u-boot pass/fail for the WiFi
+	  power problem instead of a Linux boot per attempt.
+
+config RDA_COMBO_POWER_AUTO
+	bool "Latch the combo chip on during board_init()"
+	depends on RDA_COMBO_POWER
+	help
+	  Run the PMU sequence from board_init() on every boot, so Linux
+	  inherits a powered combo chip and never needs mdcom/msys.
+
+	  Leave this off until the bench has confirmed which PMU register and
+	  bit actually is v_bt ("rdacombo scan"): until then the compiled-in
+	  sequence is only a hypothesis, and poking a guessed PMU bit on every
+	  boot is not something a bootloader should do unattended.
+
+endif

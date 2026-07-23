@@ -38,6 +38,22 @@ CONFIG_CMD_MMC=y
 CONFIG_DOS_PARTITION=y
 CONFIG_CMD_PART=y
 
+# --- I2C (this port's rda_i2c.c; i2c1 @ 0x20950000 = bus 0, the WiFi/BT combo) ---
+CONFIG_DM_I2C=y
+CONFIG_RDA_I2C=y
+CONFIG_CMD_I2C=y
+
+# --- WiFi/BT combo bring-up: "rdacombo" + "rdapmu" (MODEM-WIFI-PORT.md §9).
+#     AUTO is on: the fix (mux I2C1's SCL/SDA off the GPIO block) is confirmed on
+#     hardware — the RDA5991_G answers 0x5991/0x47 straight after it — and the
+#     mux persists into Linux, where mainline has no RDA pinctrl driver. ---
+CONFIG_RDA_COMBO_POWER=y
+CONFIG_RDA_COMBO_POWER_AUTO=y
+
+# --- md/mw: the md_sysctrl clock registers (0x11a00054 Cfg_Clk_Out,
+#     0x11a0005c Cfg_Clk_Auxclk) are poked by hand during the same bring-up ---
+CONFIG_CMD_MEMORY=y
+
 # --- filesystems: read kernel/FIT + pantavisor pv.env from ext boot part ---
 CONFIG_FS_EXT4=y
 CONFIG_CMD_EXT4=y

@@ -67,6 +67,10 @@ do_configure:prepend() {
         printf '\nconfig RDA_MMC\n\tbool "RDA Micro SD/MMC"\n\tdepends on DM_MMC\n' >> ${S}/drivers/mmc/Kconfig
     grep -q RDA_MMC ${S}/drivers/mmc/Makefile || \
         echo 'obj-$(CONFIG_RDA_MMC) += rda_mmc.o' >> ${S}/drivers/mmc/Makefile
+    grep -q RDA_I2C ${S}/drivers/i2c/Kconfig || \
+        printf '\nconfig RDA_I2C\n\tbool "RDA Micro RDA8810PL I2C"\n\tdepends on DM_I2C\n' >> ${S}/drivers/i2c/Kconfig
+    grep -q RDA_I2C ${S}/drivers/i2c/Makefile || \
+        echo 'obj-$(CONFIG_RDA_I2C) += rda_i2c.o' >> ${S}/drivers/i2c/Makefile
     grep -q RDA_TIMER ${S}/drivers/timer/Kconfig || \
         printf '\nconfig RDA_TIMER\n\tbool "RDA Micro RDA8810PL HWTIMER"\n\tdepends on TIMER\n' >> ${S}/drivers/timer/Kconfig
     grep -q RDA_TIMER ${S}/drivers/timer/Makefile || \
