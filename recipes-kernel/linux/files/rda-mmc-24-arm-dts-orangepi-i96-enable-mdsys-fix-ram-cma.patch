@@ -1,0 +1,88 @@
+From a569e6dde4fdbb54bdbcc0c4bfe946150ff179f5 Mon Sep 17 00:00:00 2001
+From: Sergio Marin <sergio.marin@pantacor.com>
+Date: Thu, 23 Jul 2026 13:44:48 -0400
+Subject: [PATCH 3/4] ARM: dts: orangepi-i96: enable mdsys, fix RAM size and
+ CMA pool
+
+Three board-level fixes for the modem/WiFi bring-up:
+
+- Enable the mdsys mailbox client. Harmless when the bootloader did not
+  start the modem: the driver's BP_INFO handshake fails and it disables
+  itself.
+
+- Stop overclaiming RAM: the vendor map is 236 MB
+  (_TGT_AP_OS_MEM_SIZE=236); the top 20 MB of the 256 MB DRAM are the
+  camera (4 MB) + VPU (16 MB) carveouts the modem firmware was built
+  against.
+
+- Shrink the CMA pool to 16 MB. The kernel image ends past 0x82000000,
+  leaving ~31 MB free in the IFC DMA window (0x80000000..0x83ffffff),
+  so the previous 32 MB pool could never fit: it failed
+  ('OF: reserved mem: failed to allocate memory for node linux,cma')
+  and fell back to a default pool outside the DMA window, defeating
+  the whole point of pinning it (latent DMA-correctness hazard for the
+  rda-mmc bounce buffers). 16 MB fits comfortably.
+
+Upstream-Status: Inappropriate [board bring-up, local drivers]
+---
+ .../dts/unisoc/rda8810pl-orangepi-i96.dts     | 24 +++++++++++++++++--
+ 1 file changed, 22 insertions(+), 2 deletions(-)
+
+diff --git a/arch/arm/boot/dts/unisoc/rda8810pl-orangepi-i96.dts b/arch/arm/boot/dts/unisoc/rda8810pl-orangepi-i96.dts
+index 1706ae6c586f..5c9745f8912a 100644
+--- a/arch/arm/boot/dts/unisoc/rda8810pl-orangepi-i96.dts
++++ b/arch/arm/boot/dts/unisoc/rda8810pl-orangepi-i96.dts
+@@ -23,9 +23,16 @@ chosen {
+ 		stdout-path = "serial2:921600n8";
+ 	};
+ 
++	/*
++	 * 256 MB DRAM, but the vendor reserves the top 20 MB for the
++	 * camera (4 MB) and VPU (16 MB) carveouts and reports
++	 * _TGT_AP_OS_MEM_SIZE=236. Match that: the carveout consumers do
++	 * not exist in this kernel, but the modem firmware was built
++	 * against this map.
++	 */
+ 	memory@80000000 {
+ 		device_type = "memory";
+-		reg = <0x80000000 0x10000000>;
++		reg = <0x80000000 0xec00000>;
+ 	};
+ 
+ 	reserved-memory {
+@@ -37,11 +44,14 @@ reserved-memory {
+ 		 * The IFC DMA reaches only 0x80000000..0x83ffffff (26-bit
+ 		 * start_addr). Keep the default CMA pool inside that window
+ 		 * so coherent allocations (rda-mmc bounce) are reachable.
++		 * The kernel image ends past 0x82000000, leaving ~31 MB
++		 * free in the window: a 32 MB pool cannot fit (it failed
++		 * and fell back outside the window), 16 MB does.
+ 		 */
+ 		linux,cma {
+ 			compatible = "shared-dma-pool";
+ 			reusable;
+-			size = <0x2000000>;
++			size = <0x1000000>;
+ 			alloc-ranges = <0x80000000 0x4000000>;
+ 			linux,cma-default;
+ 		};
+@@ -88,6 +98,16 @@ &mmc2 {
+ 	rda,mclk-inv;
+ };
+ 
++/*
++ * The modem coprocessor gates the RDA5991 combo chip's 26 MHz reference;
++ * the msys client asks it for the supply and clocks over the mailbox.
++ * Harmless when the bootloader did not start the modem: the driver
++ * detects that and disables itself.
++ */
++&mdsys {
++	status = "okay";
++};
++
+ /* Bus 0: hosts the RDA599x WiFi/BT combo control interface. */
+ &i2c1 {
+ 	status = "okay";
+-- 
+2.55.0
+

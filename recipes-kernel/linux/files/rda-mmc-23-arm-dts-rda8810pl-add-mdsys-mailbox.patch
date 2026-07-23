@@ -1,0 +1,43 @@
+From c5b7fb21bd46cc0f9cc0f8f5da40f514839a2ffe Mon Sep 17 00:00:00 2001
+From: Sergio Marin <sergio.marin@pantacor.com>
+Date: Thu, 23 Jul 2026 13:44:48 -0400
+Subject: [PATCH 2/4] ARM: dts: rda8810pl: add the mdcom/msys mailbox
+
+AP<->modem mailbox: the dedicated 8 KB dpram at 0x00200000 plus the AP
+COMREG bank at 0x20980000 (cause/mask/it_set/it_clr), interrupt 19
+(COMREG1). Consumed by the rda-mdsys msys command client. Disabled by
+default like the other SoC peripherals.
+
+Upstream-Status: Inappropriate [depends on local rda-mdsys driver]
+---
+ arch/arm/boot/dts/unisoc/rda8810pl.dtsi | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/arch/arm/boot/dts/unisoc/rda8810pl.dtsi b/arch/arm/boot/dts/unisoc/rda8810pl.dtsi
+index 41125672932f..9e788daf4bb3 100644
+--- a/arch/arm/boot/dts/unisoc/rda8810pl.dtsi
++++ b/arch/arm/boot/dts/unisoc/rda8810pl.dtsi
+@@ -35,6 +35,20 @@ sram@100000 {
+ 		ranges;
+ 	};
+ 
++	/*
++	 * AP<->modem mailbox: dedicated dpram plus the AP COMREG bank.
++	 * The msys command client uses it to ask the modem coprocessor
++	 * for PMU rails and low-frequency clocks.
++	 */
++	mdsys: mailbox@200000 {
++		compatible = "rda,8810pl-mdsys";
++		reg = <0x200000 0x2000>,
++		      <0x20980000 0x1000>;
++		reg-names = "dpram", "comregs";
++		interrupts = <19 IRQ_TYPE_LEVEL_HIGH>;
++		status = "disabled";
++	};
++
+ 	modem@10000000 {
+ 		compatible = "simple-bus";
+ 		#address-cells = <1>;
+-- 
+2.55.0
+

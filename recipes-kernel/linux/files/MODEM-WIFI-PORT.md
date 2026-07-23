@@ -1,6 +1,6 @@
 # Orange Pi i96 (RDA8810PL) — Modem / WiFi bring-up port plan
 
-Status: **stage 2 solved (pinmux); stage 3 needs the modem after all.**
+Status: **stage 2 solved (pinmux); stage 3: msys client implemented (§13), awaiting bench.**
 
 - **Stage 2 (I2C control) — DONE.** Not a modem problem: two pinmux bits. See §10.
 - **Stage 3 (SDIO data) — BLOCKED, cause identified §11.** The vendor u-boot loads
@@ -575,3 +575,72 @@ unmuxed, and a "no FDT" kernel hang misread as a modem failure. **Verify the
 instrument before believing a negative result.** Where possible use a positive
 control: mmc0 runs the same driver as mmc1 and diffing their live registers was
 worth more than any amount of reasoning.
+
+---
+
+## 13. The msys client exists (2026-07-23) — bench it
+
+§12's "next step" — half (2) of strategy A, the AP-side msys client — is now
+implemented as kernel patches 22–25 (`linux-yocto_%.bbappend`):
+
+| Patch | What |
+|-------|------|
+| 22 | `drivers/misc/rda-mdsys.c` + `include/linux/rda-mdsys.h` — minimal mdcom SYS-channel + msys client (`CONFIG_RDA_MDSYS`) |
+| 23 | `rda8810pl.dtsi`: `mdsys: mailbox@200000` node (dpram `0x00200000` + comregs `0x20980000`, irq 19/COMREG1) |
+| 24 | board dts: enable mdsys; RAM 236 MB (vendor map); CMA 16 MB so it finally fits the IFC DMA window (§12 cheap items 1+2 done) |
+| 25 | `rda_combo_power_main.c`: the `enable_26m_regulator`/`enable_26m_rtc`/`enable_32k_rtc` stubs now send `SYS_PM_CMD_EN(v_bt=10)` / `SYS_GEN_CMD_AUX_CLK(1)` / `SYS_GEN_CMD_CLK_OUT(1)` with the vendor's mask refcounting |
+
+Driver behaviour: at probe it reads the heartbeat version (dpram `+0x0c`) and
+handshakes with a side-effect-free `SYS_GEN_CMD_BP_INFO`. No modem → it logs
+"modem not running" and every call returns `-ENODEV` fast, so the modemless
+boot is unchanged. Protocol verified against vendor `md.c`/`md_sys.c` and
+u-boot `defs_mdcom.h` (channel addresses match register for register).
+
+### Resolved: the modem does NOT live in AP DRAM
+
+The vendor u-boot decodes the `modem.bin` load addresses through
+`rda_mdcom_address_modem2ap()`: the i96 target defines **no**
+`_TGT_MODEM_MEM_SIZE`, so `RDA_MODEM_RAM_BASE = RDA_MD_PSRAM_BASE =
+0x10000000 + 0x02000000 = AP phys 0x12000000` (4 MB dedicated modem PSRAM
+behind the modem bridge window). The raminit stub (`0x01c16000`) goes to modem
+internal SRAM via `RDA_ADD_M2A` (`0x11c16000`). Consequences:
+
+- **No reserved-memory nodes are needed** — the modem firmware never occupies
+  AP DRAM, and our 31 MB kernel image cannot corrupt it. The §12 vendor-card
+  experiment is therefore *not* invalidated by a memory collision.
+- `MD_ADDRESS_VALID`'s `0x82000000..0x84000000` ranges are **modem logical
+  addresses** carried inside msys messages, not AP phys.
+- The mdcom dpram at `0x00200000` is dedicated SRAM, also not DRAM.
+
+### Bench procedure (vendor card, no reflash of our u-boot needed)
+
+1. Put the new `pv-zImage-dtb` (zImage+dtb concatenated) and `pv-uInitrd` on
+   the vendor BOOT partition.
+2. At the vendor u-boot prompt: run the modem init (`mdcom_loadm` path from
+   its `boot.cmd`), the two pinmux `mw.l` writes, then
+   `bootz ${kernel_addr} ${initrd_addr}`.
+3. Expect in dmesg: `rda-mdsys ...: modem running, interface version
+   0x00010001`. If instead the BP_INFO handshake times out, the transport
+   port needs debugging before anything else (broken-instrument rule).
+4. Watch the combo power-on: the helpers now log `v_bt enable failed` /
+   `aux 26M enable failed` warnings if msys commands fail — silence means the
+   commands were ACKed by the modem.
+5. Then the moment of truth: `mmc1: new SDIO card` in dmesg after the
+   rda-mmc rebind (or automatically at boot).
+6. Manual experiments without reboot, in any order:
+   ```
+   cat  /sys/devices/platform/200000.mailbox/modem_state
+   echo "pm 10 1" > /sys/devices/platform/200000.mailbox/cmd    # v_bt on
+   echo "aux 1"   > /sys/devices/platform/200000.mailbox/cmd    # 26M aux
+   echo "out 1"   > /sys/devices/platform/200000.mailbox/cmd    # 32k out
+   echo 20a60000.mmc > /sys/bus/platform/drivers/rda-mmc/unbind
+   echo 20a60000.mmc > /sys/bus/platform/drivers/rda-mmc/bind
+   dmesg | tail
+   ```
+
+If SDIO answers: stage 3 is done; port `mdcom_loadm` into our u-boot stage-2
+(half 1 of strategy A) so the modem starts on our own bootloader, then move to
+stage 4 (`rdawlan`). If SDIO still fails with the modem confirmed running and
+all three msys commands ACKed, the remaining suspects are the vendor's
+`SYS_PM_CMD_SET_LEVEL` (voltage) and whatever `wifi_power_on`'s msys-side
+tables did — capture `modem_state` + a PMU dump and re-plan.

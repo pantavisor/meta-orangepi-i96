@@ -43,3 +43,16 @@ SRC_URI:append:orangepi-i96 = " \
     file://rda-mmc-20-mmc-rda-report-a-missing-response-as-a-timeout.patch \
     file://rda-mmc-21-mmc-rda-fix-drvdata-type-confusion-in-remove.patch \
 "
+
+# WiFi bring-up stage 3: the modem coprocessor gates the RDA5991's 26 MHz
+# reference, so the SDIO core never answers on a modemless boot. Minimal
+# mdcom/msys client so the AP can ask the (bootloader-started) modem for the
+# v_bt supply and the 26M/32k clocks. Also fixes the board RAM size (236 MB
+# vendor map) and the CMA pool (16 MB so it actually fits in the IFC DMA
+# window). See recipes-kernel/linux/files/MODEM-WIFI-PORT.md.
+SRC_URI:append:orangepi-i96 = " \
+    file://rda-mmc-22-misc-add-rda8810pl-mdcom-msys-client.patch \
+    file://rda-mmc-23-arm-dts-rda8810pl-add-mdsys-mailbox.patch \
+    file://rda-mmc-24-arm-dts-orangepi-i96-enable-mdsys-fix-ram-cma.patch \
+    file://rda-mmc-25-wifi-rda-combo-clocks-ldo-via-msys.patch \
+"

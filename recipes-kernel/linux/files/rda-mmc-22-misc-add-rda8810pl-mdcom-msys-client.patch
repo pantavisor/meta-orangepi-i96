@@ -1,0 +1,702 @@
+From 5f924e546ae93eaba1404879869aed61b97d7762 Mon Sep 17 00:00:00 2001
+From: Sergio Marin <sergio.marin@pantacor.com>
+Date: Thu, 23 Jul 2026 13:44:48 -0400
+Subject: [PATCH 1/4] misc: add RDA8810PL mdcom/msys modem command client
+
+The RDA8810PL modem coprocessor owns the PMU rails and the
+low-frequency clock gates; the AP requests them over the mdcom mailbox
+(dedicated dpram at 0x00200000) with framed msys commands. The RDA5991
+combo chip's SDIO core needs the modem-gated 26 MHz reference, which is
+why stage 3 (SDIO probe) times out on a modemless boot even though the
+always-on I2C slave answers.
+
+Minimal forward-port of the vendor 3.10 md.c + md_sys.c pair:
+- SYS channel only (packet framing, magic 0xA8B1), synchronous
+  commands only, one in flight;
+- probe handshakes with a side-effect-free BP_INFO command and
+  disables itself when the bootloader did not start the modem;
+- exported helpers for exactly what the combo chip needs:
+  v_bt supply (SYS_PM_CMD_EN pm_id 10), aux 26 MHz
+  (SYS_GEN_CMD_AUX_CLK) and 32 kHz clock out (SYS_GEN_CMD_CLK_OUT);
+- a sysfs cmd attribute for bench experiments
+  (echo "pm 10 1" / "aux 1" / "out 1" / "raw <mod> <msg> ...").
+
+Protocol constants and ring semantics verified against the vendor
+kernel (arch/arm/plat-rda/) and vendor u-boot (defs_mdcom.h channel
+addresses match the kernel layout register for register).
+
+Upstream-Status: Inappropriate [local forward-port of vendor protocol]
+---
+ drivers/misc/Kconfig      |  12 +
+ drivers/misc/Makefile     |   1 +
+ drivers/misc/rda-mdsys.c  | 531 ++++++++++++++++++++++++++++++++++++++
+ include/linux/rda-mdsys.h |  84 ++++++
+ 4 files changed, 628 insertions(+)
+ create mode 100644 drivers/misc/rda-mdsys.c
+ create mode 100644 include/linux/rda-mdsys.h
+
+diff --git a/drivers/misc/Kconfig b/drivers/misc/Kconfig
+index cadd4a820c03..9cfce8397a73 100644
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -57,6 +57,18 @@ config DUMMY_IRQ
+ 	  The sole purpose of this module is to help with debugging of systems on
+ 	  which spurious IRQs would happen on disabled IRQ vector.
+ 
++config RDA_MDSYS
++	bool "RDA8810PL modem msys command client"
++	depends on ARCH_RDA || COMPILE_TEST
++	help
++	  Minimal AP-side client for the RDA8810PL modem coprocessor's
++	  mdcom mailbox / msys command protocol. The modem owns the PMU
++	  rails and low-frequency clock gates; this client lets the AP
++	  request them (v_bt supply, 26 MHz aux clock, 32 kHz clock out)
++	  once the bootloader has loaded and started the modem firmware.
++	  Needed for the RDA5991 WiFi/BT combo SDIO data path on boards
++	  like the Orange Pi i96.
++
+ config IBM_ASM
+ 	tristate "Device driver for IBM RSA service processor"
+ 	depends on X86 && PCI && INPUT
+diff --git a/drivers/misc/Makefile b/drivers/misc/Makefile
+index f2a4d1ff65d4..3b2cc23dd1f7 100644
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -10,6 +10,7 @@ obj-$(CONFIG_AD525X_DPOT_I2C)	+= ad525x_dpot-i2c.o
+ obj-$(CONFIG_AD525X_DPOT_SPI)	+= ad525x_dpot-spi.o
+ obj-$(CONFIG_ATMEL_SSC)		+= atmel-ssc.o
+ obj-$(CONFIG_DUMMY_IRQ)		+= dummy-irq.o
++obj-$(CONFIG_RDA_MDSYS)		+= rda-mdsys.o
+ obj-$(CONFIG_ICS932S401)	+= ics932s401.o
+ obj-$(CONFIG_LKDTM)		+= lkdtm/
+ obj-$(CONFIG_TIFM_CORE)       	+= tifm_core.o
+diff --git a/drivers/misc/rda-mdsys.c b/drivers/misc/rda-mdsys.c
+new file mode 100644
+index 000000000000..910e8373f140
+--- /dev/null
++++ b/drivers/misc/rda-mdsys.c
+@@ -0,0 +1,531 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * rda-mdsys.c - Minimal AP-side mdcom/msys client for the RDA8810PL
++ *
++ * The RDA8810PL pairs the Cortex-A5 AP with a baseband coprocessor
++ * ("modem", xcpu) that owns the PMU rails and the low-frequency clock
++ * gates. The AP asks for those through a mailbox in dedicated dpram at
++ * 0x00200000 ("mdcom"), using the framed "msys" command protocol on the
++ * SYS channel. This is a minimal forward-port of the vendor 3.10
++ * arch/arm/plat-rda/md.c + md_sys.c pair: SYS channel only, synchronous
++ * commands only, one command in flight at a time.
++ *
++ * The modem firmware must have been loaded into its PSRAM and started
++ * by the bootloader (vendor u-boot: mdcom_loadm + mdcom_check). Probe
++ * performs a BP_INFO handshake; if it fails, the modem is considered
++ * absent and every later command fails fast with -ENODEV.
++ *
++ * A sysfs `cmd` attribute allows bench experiments from userspace:
++ *   echo "pm 10 1"  > /sys/devices/platform/200000.mailbox/cmd   v_bt on
++ *   echo "aux 1"    > /sys/devices/platform/200000.mailbox/cmd   26M on
++ *   echo "out 1"    > /sys/devices/platform/200000.mailbox/cmd   32k out
++ *   echo "raw 0 0x1007" > .../cmd                                BP_INFO
++ */
++
++#include <linux/completion.h>
++#include <linux/delay.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/rda-mdsys.h>
++#include <linux/spinlock.h>
++#include <linux/string.h>
++
++/* AP comregs (COMREG1 bank, 0x20980000) */
++#define COMREGS_CAUSE		0x08
++#define COMREGS_MASK_SET	0x0c
++#define COMREGS_MASK_CLR	0x10
++#define COMREGS_IT_SET		0x14
++#define COMREGS_IT_CLR		0x18
++
++#define BP_SHUTDOWN_BIT		BIT(5)
++#define SYS_READY_BIT		BIT(10)
++#define IRQ1_MASK_ALL		(0xff << 8)
++
++/*
++ * dpram layout, SYS channel only (vendor plat/rda_md.h). "read" is
++ * modem-to-AP, "write" is AP-to-modem. Each ctrl block is
++ * { u32 tail; u32 head; u32 res[2]; }: data valid [tail, head).
++ */
++#define HB_VERSION		0x0c	/* heartbeat: interface version */
++#define SYS_RX_CTRL		0x10
++#define SYS_RX_BUF		0x20
++#define SYS_RX_SIZE		0x200
++#define SYS_TX_CTRL		0x220
++#define SYS_TX_BUF		0x230
++#define SYS_TX_SIZE		0x200
++#define CH_TAIL			0x0
++#define CH_HEAD			0x4
++
++#define MD_SYS_MAGIC		0xa8b1
++#define SYS_REPLY_FLAG		0x8000
++#define SYS_MESG_MASK		0x7fff
++#define MD_SYS_PACKET_MAX	144
++#define MDSYS_REQ_TOKEN		0x4d445359	/* "MDSY", echoed by BP */
++#define MDSYS_CMD_TIMEOUT_MS	500
++
++struct md_sys_hdr {
++	u16 magic;
++	u16 mod_id;
++	u32 req_id;
++	u32 ret_val;
++	u16 msg_id;
++	u16 ext_len;
++};
++
++#define MD_SYS_HDR_SIZE		sizeof(struct md_sys_hdr)
++
++struct rda_mdsys {
++	struct device *dev;
++	void __iomem *dpram;
++	void __iomem *comregs;
++
++	struct mutex cmd_lock;		/* one command in flight */
++	spinlock_t ring_lock;		/* rx ring + reply matching */
++	struct completion done;
++
++	/* reply matching state, valid while a command is pending */
++	u16 wait_msg;			/* 0 = nothing pending */
++	u32 reply_status;
++	void *reply_buf;
++	int reply_cap;
++	int reply_len;
++
++	bool running;
++	u32 version;
++};
++
++static struct rda_mdsys *g_mdsys;
++
++/* ---- ring helpers ---------------------------------------------------- */
++
++static void mdsys_ring_copy_from(struct rda_mdsys *md, void *dst,
++				 u32 tail, int len)
++{
++	int n = min_t(int, len, SYS_RX_SIZE - tail);
++
++	memcpy_fromio(dst, md->dpram + SYS_RX_BUF + tail, n);
++	if (len > n)
++		memcpy_fromio(dst + n, md->dpram + SYS_RX_BUF, len - n);
++}
++
++/* Returns bytes written, or -EBUSY when the ring has no room. */
++static int mdsys_tx_frame(struct rda_mdsys *md, const void *buf, int len)
++{
++	u32 head = readl(md->dpram + SYS_TX_CTRL + CH_HEAD);
++	u32 tail = readl(md->dpram + SYS_TX_CTRL + CH_TAIL);
++	u32 mask = SYS_TX_SIZE - 1;
++	int avail = mask - ((head - tail) & mask);
++	int n;
++
++	if (avail < len)
++		return -EBUSY;
++
++	n = min_t(int, len, SYS_TX_SIZE - head);
++	memcpy_toio(md->dpram + SYS_TX_BUF + head, buf, n);
++	if (len > n)
++		memcpy_toio(md->dpram + SYS_TX_BUF, buf + n, len - n);
++
++	writel((head + len) & mask, md->dpram + SYS_TX_CTRL + CH_HEAD);
++	/* Tell the BP the SYS channel has data. */
++	writel(SYS_READY_BIT, md->comregs + COMREGS_IT_SET);
++
++	return len;
++}
++
++/* ---- rx path --------------------------------------------------------- */
++
++/* Called under ring_lock. */
++static void mdsys_handle_frame(struct rda_mdsys *md,
++			       const struct md_sys_hdr *hdr, const void *ext)
++{
++	if ((hdr->msg_id & SYS_REPLY_FLAG) && md->wait_msg &&
++	    (hdr->msg_id & SYS_MESG_MASK) == md->wait_msg &&
++	    hdr->req_id == MDSYS_REQ_TOKEN) {
++		md->reply_status = hdr->ret_val;
++		md->reply_len = 0;
++		if (hdr->ext_len && md->reply_buf) {
++			md->reply_len = min_t(int, hdr->ext_len,
++					      md->reply_cap);
++			memcpy(md->reply_buf, ext, md->reply_len);
++		}
++		md->wait_msg = 0;
++		complete(&md->done);
++		return;
++	}
++
++	/* Unsolicited BP notification (battery status etc.) - ignore. */
++	dev_dbg(md->dev, "dropped frame mod=%#x msg=%#x ret=%#x ext=%u\n",
++		hdr->mod_id, hdr->msg_id, hdr->ret_val, hdr->ext_len);
++}
++
++static void mdsys_drain_rx(struct rda_mdsys *md)
++{
++	unsigned char frame[SYS_RX_SIZE];
++	struct md_sys_hdr hdr;
++	unsigned long flags;
++	u32 mask = SYS_RX_SIZE - 1;
++
++	spin_lock_irqsave(&md->ring_lock, flags);
++	for (;;) {
++		u32 head = readl(md->dpram + SYS_RX_CTRL + CH_HEAD);
++		u32 tail = readl(md->dpram + SYS_RX_CTRL + CH_TAIL);
++		int used = (head - tail) & mask;
++		int frame_len;
++
++		if (used < MD_SYS_HDR_SIZE)
++			break;
++
++		mdsys_ring_copy_from(md, &hdr, tail, MD_SYS_HDR_SIZE);
++		if (hdr.magic != MD_SYS_MAGIC) {
++			/*
++			 * Lost frame sync: drop everything and resync at
++			 * the write pointer.
++			 */
++			dev_warn(md->dev, "bad magic %#x, resetting ring\n",
++				 hdr.magic);
++			writel(head, md->dpram + SYS_RX_CTRL + CH_TAIL);
++			break;
++		}
++
++		frame_len = MD_SYS_HDR_SIZE + ALIGN(hdr.ext_len, 4);
++		if (frame_len > SYS_RX_SIZE) {
++			dev_warn(md->dev, "oversized frame (%d), resetting\n",
++				 frame_len);
++			writel(head, md->dpram + SYS_RX_CTRL + CH_TAIL);
++			break;
++		}
++		if (used < frame_len)
++			break;	/* partial frame, BP still writing */
++
++		mdsys_ring_copy_from(md, frame, tail, frame_len);
++		writel((tail + frame_len) & mask,
++		       md->dpram + SYS_RX_CTRL + CH_TAIL);
++
++		mdsys_handle_frame(md, (struct md_sys_hdr *)frame,
++				   frame + MD_SYS_HDR_SIZE);
++	}
++	spin_unlock_irqrestore(&md->ring_lock, flags);
++}
++
++static irqreturn_t rda_mdsys_interrupt(int irq, void *data)
++{
++	struct rda_mdsys *md = data;
++	u32 cause = readl(md->comregs + COMREGS_CAUSE);
++
++	if (!(cause & SYS_READY_BIT))
++		return IRQ_NONE;
++
++	/* Ack first; the BP re-raises for frames posted while we drain. */
++	writel(SYS_READY_BIT, md->comregs + COMREGS_IT_CLR);
++	readl(md->comregs + COMREGS_IT_CLR);
++
++	mdsys_drain_rx(md);
++
++	return IRQ_HANDLED;
++}
++
++/* ---- command path ---------------------------------------------------- */
++
++static int __rda_mdsys_cmd(struct rda_mdsys *md, u16 mod_id, u16 msg_id,
++			   const void *data, int len, void *out, int out_cap)
++{
++	unsigned char frame[MD_SYS_PACKET_MAX];
++	struct md_sys_hdr *hdr = (struct md_sys_hdr *)frame;
++	unsigned long flags;
++	int pkt_size = MD_SYS_HDR_SIZE + len;
++	int ret;
++	int i;
++
++	if (len < 0 || !IS_ALIGNED(len, 4) ||
++	    len > MD_SYS_PACKET_MAX - (int)MD_SYS_HDR_SIZE)
++		return -EINVAL;
++
++	mutex_lock(&md->cmd_lock);
++
++	if (readl(md->comregs + COMREGS_IT_CLR) & BP_SHUTDOWN_BIT) {
++		dev_warn(md->dev, "BP is shut down\n");
++		mutex_unlock(&md->cmd_lock);
++		return -ENODEV;
++	}
++
++	hdr->magic = MD_SYS_MAGIC;
++	hdr->mod_id = mod_id;
++	hdr->msg_id = msg_id;
++	hdr->req_id = MDSYS_REQ_TOKEN;
++	hdr->ret_val = 0;
++	hdr->ext_len = len;
++	if (len)
++		memcpy(frame + MD_SYS_HDR_SIZE, data, len);
++
++	/* Arm reply matching before tx: the BP can answer immediately. */
++	spin_lock_irqsave(&md->ring_lock, flags);
++	md->wait_msg = msg_id;
++	md->reply_buf = out;
++	md->reply_cap = out_cap;
++	md->reply_len = 0;
++	md->reply_status = 0;
++	reinit_completion(&md->done);
++	spin_unlock_irqrestore(&md->ring_lock, flags);
++
++	for (i = 0; i < 10; i++) {
++		ret = mdsys_tx_frame(md, frame, pkt_size);
++		if (ret != -EBUSY)
++			break;
++		msleep(1);
++	}
++	if (ret < 0)
++		goto out_disarm;
++
++	if (!wait_for_completion_timeout(&md->done,
++			msecs_to_jiffies(MDSYS_CMD_TIMEOUT_MS))) {
++		dev_warn(md->dev, "cmd mod=%#x msg=%#x timed out\n",
++			 mod_id, msg_id);
++		ret = -ETIMEDOUT;
++		goto out_disarm;
++	}
++
++	if (md->reply_status) {
++		dev_warn(md->dev, "cmd mod=%#x msg=%#x failed: BP status %#x\n",
++			 mod_id, msg_id, md->reply_status);
++		ret = -EIO;
++	} else {
++		ret = 0;
++	}
++
++out_disarm:
++	spin_lock_irqsave(&md->ring_lock, flags);
++	md->wait_msg = 0;
++	md->reply_buf = NULL;
++	spin_unlock_irqrestore(&md->ring_lock, flags);
++
++	mutex_unlock(&md->cmd_lock);
++	return ret;
++}
++
++bool rda_mdsys_running(void)
++{
++	return g_mdsys && g_mdsys->running;
++}
++EXPORT_SYMBOL_GPL(rda_mdsys_running);
++
++int rda_mdsys_cmd(u16 mod_id, u16 msg_id, const void *data, int len,
++		  void *out, int out_cap)
++{
++	if (!g_mdsys || !g_mdsys->running)
++		return -ENODEV;
++
++	return __rda_mdsys_cmd(g_mdsys, mod_id, msg_id, data, len,
++			       out, out_cap);
++}
++EXPORT_SYMBOL_GPL(rda_mdsys_cmd);
++
++int rda_mdsys_pm_enable(u32 pm_id, bool on)
++{
++	u32 param[2] = { pm_id, on ? 1 : 0 };
++
++	return rda_mdsys_cmd(RDA_MDSYS_PM_MOD, RDA_MDSYS_PM_CMD_EN,
++			     param, sizeof(param), NULL, 0);
++}
++EXPORT_SYMBOL_GPL(rda_mdsys_pm_enable);
++
++int rda_mdsys_aux_clk(bool on)
++{
++	u32 param = on ? 1 : 0;
++
++	return rda_mdsys_cmd(RDA_MDSYS_GEN_MOD, RDA_MDSYS_GEN_CMD_AUX_CLK,
++			     &param, sizeof(param), NULL, 0);
++}
++EXPORT_SYMBOL_GPL(rda_mdsys_aux_clk);
++
++int rda_mdsys_clk_out(u32 mode)
++{
++	return rda_mdsys_cmd(RDA_MDSYS_GEN_MOD, RDA_MDSYS_GEN_CMD_CLK_OUT,
++			     &mode, sizeof(mode), NULL, 0);
++}
++EXPORT_SYMBOL_GPL(rda_mdsys_clk_out);
++
++/* ---- sysfs bench interface ------------------------------------------- */
++
++static ssize_t modem_state_show(struct device *dev,
++				struct device_attribute *attr, char *buf)
++{
++	struct rda_mdsys *md = dev_get_drvdata(dev);
++
++	if (md->running)
++		return sysfs_emit(buf, "running version=%#010x\n",
++				  md->version);
++	return sysfs_emit(buf, "down version=%#010x\n", md->version);
++}
++static DEVICE_ATTR_RO(modem_state);
++
++static ssize_t cmd_store(struct device *dev, struct device_attribute *attr,
++			 const char *buf, size_t count)
++{
++	struct rda_mdsys *md = dev_get_drvdata(dev);
++	char tmp[128];
++	char *s = tmp;
++	char *tok;
++	int ret = -EINVAL;
++
++	if (!md->running)
++		return -ENODEV;
++	if (count >= sizeof(tmp))
++		return -E2BIG;
++	memcpy(tmp, buf, count);
++	tmp[count] = '\0';
++
++	tok = strsep(&s, " \n");
++	if (!tok)
++		return -EINVAL;
++
++	if (!strcmp(tok, "pm")) {
++		u32 id, val;
++
++		if (!s || sscanf(s, "%u %u", &id, &val) != 2)
++			return -EINVAL;
++		ret = rda_mdsys_pm_enable(id, val);
++	} else if (!strcmp(tok, "aux")) {
++		u32 val;
++
++		if (!s || kstrtou32(strim(s), 0, &val))
++			return -EINVAL;
++		ret = rda_mdsys_aux_clk(val);
++	} else if (!strcmp(tok, "out")) {
++		u32 val;
++
++		if (!s || kstrtou32(strim(s), 0, &val))
++			return -EINVAL;
++		ret = rda_mdsys_clk_out(val);
++	} else if (!strcmp(tok, "raw")) {
++		u32 mod, msg, param[16];
++		int n = 0;
++
++		tok = strsep(&s, " \n");
++		if (!tok || kstrtou32(tok, 0, &mod))
++			return -EINVAL;
++		tok = strsep(&s, " \n");
++		if (!tok || kstrtou32(tok, 0, &msg))
++			return -EINVAL;
++		while (n < 16 && (tok = strsep(&s, " \n")) && *tok) {
++			if (kstrtou32(tok, 0, &param[n]))
++				return -EINVAL;
++			n++;
++		}
++		ret = rda_mdsys_cmd(mod, msg, param, n * 4, NULL, 0);
++	}
++
++	dev_info(dev, "cmd \"%s\": %d\n", tmp, ret);
++	return ret ? ret : count;
++}
++static DEVICE_ATTR_WO(cmd);
++
++static struct attribute *rda_mdsys_attrs[] = {
++	&dev_attr_modem_state.attr,
++	&dev_attr_cmd.attr,
++	NULL
++};
++ATTRIBUTE_GROUPS(rda_mdsys);
++
++/* ---- probe ----------------------------------------------------------- */
++
++static int rda_mdsys_probe(struct platform_device *pdev)
++{
++	struct rda_mdsys *md;
++	unsigned char info[128];
++	int irq;
++	int ret;
++
++	md = devm_kzalloc(&pdev->dev, sizeof(*md), GFP_KERNEL);
++	if (!md)
++		return -ENOMEM;
++
++	md->dev = &pdev->dev;
++	mutex_init(&md->cmd_lock);
++	spin_lock_init(&md->ring_lock);
++	init_completion(&md->done);
++
++	md->dpram = devm_platform_ioremap_resource_byname(pdev, "dpram");
++	if (IS_ERR(md->dpram))
++		return PTR_ERR(md->dpram);
++
++	md->comregs = devm_platform_ioremap_resource_byname(pdev, "comregs");
++	if (IS_ERR(md->comregs))
++		return PTR_ERR(md->comregs);
++
++	irq = platform_get_irq(pdev, 0);
++	if (irq < 0)
++		return irq;
++
++	md->version = readl(md->dpram + HB_VERSION);
++
++	/* Mask everything, then enable only the SYS channel. */
++	writel(IRQ1_MASK_ALL, md->comregs + COMREGS_MASK_CLR);
++	ret = devm_request_irq(&pdev->dev, irq, rda_mdsys_interrupt, 0,
++			       "rda-mdsys", md);
++	if (ret)
++		return ret;
++	writel(SYS_READY_BIT, md->comregs + COMREGS_MASK_SET);
++
++	platform_set_drvdata(pdev, md);
++	g_mdsys = md;
++
++	/*
++	 * Handshake: BP_INFO is side-effect free. It only succeeds when the
++	 * bootloader loaded and started the modem firmware.
++	 */
++	if (md->version && md->version != 0xffffffff) {
++		md->running = true;
++		ret = __rda_mdsys_cmd(md, RDA_MDSYS_GEN_MOD,
++				      RDA_MDSYS_GEN_CMD_BP_INFO, NULL, 0,
++				      info, sizeof(info));
++		if (ret) {
++			md->running = false;
++			dev_warn(&pdev->dev,
++				 "modem handshake failed (%d); msys disabled\n",
++				 ret);
++		} else {
++			dev_info(&pdev->dev,
++				 "modem running, interface version %#010x\n",
++				 md->version);
++		}
++	} else {
++		dev_info(&pdev->dev,
++			 "modem not running (heartbeat %#010x); msys disabled\n",
++			 md->version);
++	}
++
++	return 0;
++}
++
++static void rda_mdsys_remove(struct platform_device *pdev)
++{
++	struct rda_mdsys *md = platform_get_drvdata(pdev);
++
++	writel(IRQ1_MASK_ALL, md->comregs + COMREGS_MASK_CLR);
++	g_mdsys = NULL;
++}
++
++static const struct of_device_id rda_mdsys_dt_matches[] = {
++	{ .compatible = "rda,8810pl-mdsys" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, rda_mdsys_dt_matches);
++
++static struct platform_driver rda_mdsys_driver = {
++	.probe = rda_mdsys_probe,
++	.remove_new = rda_mdsys_remove,
++	.driver = {
++		.name = "rda-mdsys",
++		.of_match_table = rda_mdsys_dt_matches,
++		.dev_groups = rda_mdsys_groups,
++	},
++};
++module_platform_driver(rda_mdsys_driver);
++
++MODULE_DESCRIPTION("RDA8810PL mdcom/msys modem command client");
++MODULE_LICENSE("GPL");
+diff --git a/include/linux/rda-mdsys.h b/include/linux/rda-mdsys.h
+new file mode 100644
+index 000000000000..028fb99db403
+--- /dev/null
++++ b/include/linux/rda-mdsys.h
+@@ -0,0 +1,84 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * rda-mdsys.h - AP-side msys command client for the RDA8810PL modem
++ *
++ * The RDA8810PL baseband coprocessor ("modem", xcpu) owns the PMU rails
++ * and the low-frequency clock gates of the SoC. The AP requests them
++ * over the mdcom mailbox with framed "msys" commands. The command and
++ * module ids below are verbatim from the vendor 3.10 tree
++ * (arch/arm/plat-rda/include/plat/md_sys.h).
++ */
++
++#ifndef __LINUX_RDA_MDSYS_H__
++#define __LINUX_RDA_MDSYS_H__
++
++#include <linux/errno.h>
++#include <linux/types.h>
++
++/* Modules */
++#define RDA_MDSYS_GEN_MOD		0x0
++#define RDA_MDSYS_PM_MOD		0x2
++
++/* General module commands */
++#define RDA_MDSYS_GEN_CMD_CLK_OUT	0x1004	/* 0=off, 1=32k, 2=26M */
++#define RDA_MDSYS_GEN_CMD_AUX_CLK	0x1005	/* 0=off, 1=26M */
++#define RDA_MDSYS_GEN_CMD_BP_INFO	0x1007
++
++/* Power module commands */
++#define RDA_MDSYS_PM_CMD_EN		0x1001	/* {pm_id, 0|1} */
++
++/* PM ids (vendor arch/arm/mach-rda/regulator-devices.c) */
++#define RDA_MDSYS_PM_ID_BT		10	/* v_bt: RDA5991 combo supply */
++#define RDA_MDSYS_PM_ID_CAM_FLASH	11
++#define RDA_MDSYS_PM_ID_LCD		12
++
++#if IS_ENABLED(CONFIG_RDA_MDSYS)
++
++/* True once the probe handshake with the modem firmware has succeeded. */
++bool rda_mdsys_running(void);
++
++/*
++ * Send one synchronous msys command and wait for the modem's reply.
++ * @data/@len: parameter block (len must be a multiple of 4, may be 0).
++ * @out/@out_cap: optional buffer for reply parameters.
++ * Returns 0 on success (modem replied with status 0), -ENODEV when the
++ * modem is not running, -ETIMEDOUT / -EIO otherwise.
++ */
++int rda_mdsys_cmd(u16 mod_id, u16 msg_id, const void *data, int len,
++		  void *out, int out_cap);
++
++int rda_mdsys_pm_enable(u32 pm_id, bool on);
++int rda_mdsys_aux_clk(bool on);
++int rda_mdsys_clk_out(u32 mode);
++
++#else /* !CONFIG_RDA_MDSYS */
++
++static inline bool rda_mdsys_running(void)
++{
++	return false;
++}
++
++static inline int rda_mdsys_cmd(u16 mod_id, u16 msg_id, const void *data,
++				int len, void *out, int out_cap)
++{
++	return -ENODEV;
++}
++
++static inline int rda_mdsys_pm_enable(u32 pm_id, bool on)
++{
++	return -ENODEV;
++}
++
++static inline int rda_mdsys_aux_clk(bool on)
++{
++	return -ENODEV;
++}
++
++static inline int rda_mdsys_clk_out(u32 mode)
++{
++	return -ENODEV;
++}
++
++#endif /* CONFIG_RDA_MDSYS */
++
++#endif /* __LINUX_RDA_MDSYS_H__ */
+-- 
+2.55.0
+

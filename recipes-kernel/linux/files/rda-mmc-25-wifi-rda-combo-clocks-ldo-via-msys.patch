@@ -1,0 +1,147 @@
+From 2b9f1d90a6e5b546ced3937824a31a4a92d22645 Mon Sep 17 00:00:00 2001
+From: Sergio Marin <sergio.marin@pantacor.com>
+Date: Thu, 23 Jul 2026 13:44:48 -0400
+Subject: [PATCH 4/4] wifi: rda-combo: drive the 26M/32k clocks and v_bt LDO
+ via msys
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Replace the no-op enable_26m_regulator/enable_26m_rtc/enable_32k_rtc
+stubs with real implementations that forward to the rda-mdsys client,
+keeping the vendor's per-user (WLAN/BT/FM) mask refcounting: first user
+switches the resource on, last user off.
+
+This is the missing half of strategy A (MODEM-WIFI-PORT.md §12): the
+modem only switches the combo chip's supply and 26 MHz reference when
+the AP asks over msys — patch 17 stubbed exactly those calls out, which
+matches every stage-3 observation (I2C alive, SDIO mute). When the
+modem is not running the helpers degrade to warn-once no-ops, so the
+current modemless boot keeps its stage-2 behaviour.
+
+Upstream-Status: Inappropriate [local forward-port of vendor driver]
+---
+ .../rdacombodev/rda_combo_power_main.c        | 93 +++++++++++++++++--
+ 1 file changed, 83 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/net/wireless/rdaw80211/rdacombodev/rda_combo_power_main.c b/drivers/net/wireless/rdaw80211/rdacombodev/rda_combo_power_main.c
+index aeac2a152ad4..58e7ebaf1c37 100644
+--- a/drivers/net/wireless/rdaw80211/rdacombodev/rda_combo_power_main.c
++++ b/drivers/net/wireless/rdaw80211/rdacombodev/rda_combo_power_main.c
+@@ -9,9 +9,11 @@
+  * the vendor tree and drive those clients through the helpers here.
+  *
+  * The vendor 26 MHz / 32 kHz clock and LDO management went through the
+- * modem-side PMU, which mainline cannot reach yet; those helpers are
+- * no-ops here on the assumption the modem firmware keeps the shared
+- * clocks/LDO up (bench-verify via the chip version read at probe).
++ * modem coprocessor (msys commands: v_bt regulator, aux 26M clock, 32k
++ * clock out). The helpers here mirror the vendor's per-user mask
++ * refcounting and forward to the rda-mdsys client; when the modem is
++ * not running they degrade to no-ops (the always-on I2C slave still
++ * answers, but the SDIO core stays unclocked).
+  *
+  * Copyright RDA Microelectronics Company Limited
+  */
+@@ -24,6 +26,7 @@
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+ #include <linux/of.h>
++#include <linux/rda-mdsys.h>
+ 
+ #include "rda_combo.h"
+ 
+@@ -51,13 +54,83 @@ void rda_combo_i2c_unlock(void)
+ }
+ EXPORT_SYMBOL(rda_combo_i2c_unlock);
+ 
+-/* Vendor PMU-backed clock/regulator management — no-ops for now (see top). */
+-void enable_26m_regulator(u8 mask) { }
+-void disable_26m_regulator(u8 mask) { }
+-void enable_26m_rtc(u8 mask) { }
+-void disable_26m_rtc(u8 mask) { }
+-void enable_32k_rtc(u8 mask) { }
+-void disable_32k_rtc(u8 mask) { }
++/*
++ * Modem-backed clock/regulator management (see top). Same mask-based
++ * refcounting as the vendor code: first user switches the resource on,
++ * last user off. All callers run in process context under the callers'
++ * own power mutexes, but WLAN/BT/FM paths can race each other, so keep
++ * a lock of our own.
++ */
++static DEFINE_MUTEX(rda_combo_msys_mutex);
++static u8 regulator_mask;
++static u8 clock_mask_26m;
++static u8 clock_mask_32k;
++
++void enable_26m_regulator(u8 mask)
++{
++	mutex_lock(&rda_combo_msys_mutex);
++	if (!(regulator_mask & CLOCK_MASK_ALL)) {
++		if (rda_mdsys_pm_enable(RDA_MDSYS_PM_ID_BT, true))
++			pr_warn_once("rda_combo: v_bt enable failed (modem down?)\n");
++	}
++	regulator_mask |= mask;
++	mutex_unlock(&rda_combo_msys_mutex);
++}
++
++void disable_26m_regulator(u8 mask)
++{
++	mutex_lock(&rda_combo_msys_mutex);
++	if (regulator_mask & mask) {
++		regulator_mask &= ~mask;
++		if (!(regulator_mask & CLOCK_MASK_ALL))
++			rda_mdsys_pm_enable(RDA_MDSYS_PM_ID_BT, false);
++	}
++	mutex_unlock(&rda_combo_msys_mutex);
++}
++
++void enable_26m_rtc(u8 mask)
++{
++	mutex_lock(&rda_combo_msys_mutex);
++	if (!(clock_mask_26m & CLOCK_MASK_ALL)) {
++		if (rda_mdsys_aux_clk(true))
++			pr_warn_once("rda_combo: aux 26M enable failed (modem down?)\n");
++	}
++	clock_mask_26m |= mask;
++	mutex_unlock(&rda_combo_msys_mutex);
++}
++
++void disable_26m_rtc(u8 mask)
++{
++	mutex_lock(&rda_combo_msys_mutex);
++	if (clock_mask_26m & mask) {
++		clock_mask_26m &= ~mask;
++		if (!(clock_mask_26m & CLOCK_MASK_ALL))
++			rda_mdsys_aux_clk(false);
++	}
++	mutex_unlock(&rda_combo_msys_mutex);
++}
++
++void enable_32k_rtc(u8 mask)
++{
++	mutex_lock(&rda_combo_msys_mutex);
++	if (!(clock_mask_32k & CLOCK_MASK_ALL)) {
++		if (rda_mdsys_clk_out(1))
++			pr_warn_once("rda_combo: 32k clk_out enable failed (modem down?)\n");
++	}
++	clock_mask_32k |= mask;
++	mutex_unlock(&rda_combo_msys_mutex);
++}
++
++void disable_32k_rtc(u8 mask)
++{
++	mutex_lock(&rda_combo_msys_mutex);
++	if (clock_mask_32k & mask) {
++		clock_mask_32k &= ~mask;
++		if (!(clock_mask_32k & CLOCK_MASK_ALL))
++			rda_mdsys_clk_out(0);
++	}
++	mutex_unlock(&rda_combo_msys_mutex);
++}
+ 
+ int i2c_write_1_addr_2_data(struct i2c_client *client, const u8 addr,
+ 			    const u16 data)
+-- 
+2.55.0
+
