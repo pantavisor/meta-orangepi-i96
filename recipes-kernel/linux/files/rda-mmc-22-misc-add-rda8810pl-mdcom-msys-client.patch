@@ -1,4 +1,4 @@
-From 5f924e546ae93eaba1404879869aed61b97d7762 Mon Sep 17 00:00:00 2001
+From ee702ba0025b298f75d20376790b194963fc8805 Mon Sep 17 00:00:00 2001
 From: Sergio Marin <sergio.marin@pantacor.com>
 Date: Thu, 23 Jul 2026 13:44:48 -0400
 Subject: [PATCH 1/4] misc: add RDA8810PL mdcom/msys modem command client
@@ -29,9 +29,9 @@ Upstream-Status: Inappropriate [local forward-port of vendor protocol]
 ---
  drivers/misc/Kconfig      |  12 +
  drivers/misc/Makefile     |   1 +
- drivers/misc/rda-mdsys.c  | 531 ++++++++++++++++++++++++++++++++++++++
+ drivers/misc/rda-mdsys.c  | 564 ++++++++++++++++++++++++++++++++++++++
  include/linux/rda-mdsys.h |  84 ++++++
- 4 files changed, 628 insertions(+)
+ 4 files changed, 661 insertions(+)
  create mode 100644 drivers/misc/rda-mdsys.c
  create mode 100644 include/linux/rda-mdsys.h
 
@@ -72,10 +72,10 @@ index f2a4d1ff65d4..3b2cc23dd1f7 100644
  obj-$(CONFIG_TIFM_CORE)       	+= tifm_core.o
 diff --git a/drivers/misc/rda-mdsys.c b/drivers/misc/rda-mdsys.c
 new file mode 100644
-index 000000000000..910e8373f140
+index 000000000000..1ab3480c49b8
 --- /dev/null
 +++ b/drivers/misc/rda-mdsys.c
-@@ -0,0 +1,531 @@
+@@ -0,0 +1,564 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * rda-mdsys.c - Minimal AP-side mdcom/msys client for the RDA8810PL
@@ -191,12 +191,17 @@ index 000000000000..910e8373f140
 +		memcpy_fromio(dst + n, md->dpram + SYS_RX_BUF, len - n);
 +}
 +
-+/* Returns bytes written, or -EBUSY when the ring has no room. */
++/*
++ * Returns bytes written, or -EBUSY when the ring has no room. The ring
++ * pointers live in dpram, which nothing zeroes on a modemless boot, so
++ * mask them on every read: an unmasked garbage head would index far
++ * outside the 512-byte ring.
++ */
 +static int mdsys_tx_frame(struct rda_mdsys *md, const void *buf, int len)
 +{
-+	u32 head = readl(md->dpram + SYS_TX_CTRL + CH_HEAD);
-+	u32 tail = readl(md->dpram + SYS_TX_CTRL + CH_TAIL);
 +	u32 mask = SYS_TX_SIZE - 1;
++	u32 head = readl(md->dpram + SYS_TX_CTRL + CH_HEAD) & mask;
++	u32 tail = readl(md->dpram + SYS_TX_CTRL + CH_TAIL) & mask;
 +	int avail = mask - ((head - tail) & mask);
 +	int n;
 +
@@ -250,8 +255,8 @@ index 000000000000..910e8373f140
 +
 +	spin_lock_irqsave(&md->ring_lock, flags);
 +	for (;;) {
-+		u32 head = readl(md->dpram + SYS_RX_CTRL + CH_HEAD);
-+		u32 tail = readl(md->dpram + SYS_RX_CTRL + CH_TAIL);
++		u32 head = readl(md->dpram + SYS_RX_CTRL + CH_HEAD) & mask;
++		u32 tail = readl(md->dpram + SYS_RX_CTRL + CH_TAIL) & mask;
 +		int used = (head - tail) & mask;
 +		int frame_len;
 +
@@ -511,6 +516,30 @@ index 000000000000..910e8373f140
 +
 +/* ---- probe ----------------------------------------------------------- */
 +
++/*
++ * A bootloader that started the modem also zeroed the channel ctrl
++ * blocks ("Init mdcom channels"), and every later update keeps the
++ * pointers inside the ring. Out-of-range pointers mean nobody
++ * initialized the dpram: do not talk on it.
++ */
++static bool mdsys_rings_sane(struct rda_mdsys *md)
++{
++	static const u32 regs[] = {
++		SYS_TX_CTRL + CH_HEAD, SYS_TX_CTRL + CH_TAIL,
++		SYS_RX_CTRL + CH_HEAD, SYS_RX_CTRL + CH_TAIL,
++	};
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(regs); i++) {
++		u32 v = readl(md->dpram + regs[i]);
++
++		if (v >= SYS_TX_SIZE || !IS_ALIGNED(v, 4))
++			return false;
++	}
++
++	return true;
++}
++
 +static int rda_mdsys_probe(struct platform_device *pdev)
 +{
 +	struct rda_mdsys *md;
@@ -554,9 +583,13 @@ index 000000000000..910e8373f140
 +
 +	/*
 +	 * Handshake: BP_INFO is side-effect free. It only succeeds when the
-+	 * bootloader loaded and started the modem firmware.
++	 * bootloader loaded and started the modem firmware. Gate on the
++	 * heartbeat version AND sane (bootloader-initialized) ring pointers:
++	 * on a modemless boot the dpram is uninitialized SRAM and both can
++	 * be garbage.
 +	 */
-+	if (md->version && md->version != 0xffffffff) {
++	if (md->version && md->version != 0xffffffff &&
++	    mdsys_rings_sane(md)) {
 +		md->running = true;
 +		ret = __rda_mdsys_cmd(md, RDA_MDSYS_GEN_MOD,
 +				      RDA_MDSYS_GEN_CMD_BP_INFO, NULL, 0,

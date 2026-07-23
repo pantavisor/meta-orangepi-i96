@@ -617,8 +617,22 @@ internal SRAM via `RDA_ADD_M2A` (`0x11c16000`). Consequences:
 1. Put the new `pv-zImage-dtb` (zImage+dtb concatenated) and `pv-uInitrd` on
    the vendor BOOT partition.
 2. At the vendor u-boot prompt: run the modem init (`mdcom_loadm` path from
-   its `boot.cmd`), the two pinmux `mw.l` writes, then
-   `bootz ${kernel_addr} ${initrd_addr}`.
+   its `boot.cmd`), the two pinmux `mw.l` writes, **set bootargs**, then boot:
+   ```
+   ext2load mmc 0:1 ${modem_addr} modem.bin
+   mdcom_loadm ${modem_addr}
+   mdcom_check 1
+   mw.l 0x11a09010 0x3fffffff
+   mw.l 0x11a09008 0x7fe001ff
+   setenv bootargs "earlycon console=ttyRDA2,921600"
+   ext2load mmc 0:1 ${kernel_addr} pv-zImage-dtb
+   ext2load mmc 0:1 ${initrd_addr} pv-uInitrd
+   bootz ${kernel_addr} ${initrd_addr}
+   ```
+   The `setenv bootargs` line is NOT optional: the vendor default env does
+   not name our console, so without it the kernel boots **silently** and
+   looks exactly like a hang at "Starting kernel ..." (2026-07-23: one
+   session was lost to precisely this — broken-instrument rule again).
 3. Expect in dmesg: `rda-mdsys ...: modem running, interface version
    0x00010001`. If instead the BP_INFO handshake times out, the transport
    port needs debugging before anything else (broken-instrument rule).
@@ -643,4 +657,18 @@ If SDIO answers: stage 3 is done; port `mdcom_loadm` into our u-boot stage-2
 stage 4 (`rdawlan`). If SDIO still fails with the modem confirmed running and
 all three msys commands ACKed, the remaining suspects are the vendor's
 `SYS_PM_CMD_SET_LEVEL` (voltage) and whatever `wifi_power_on`'s msys-side
-tables did — capture `modem_state` + a PMU dump and re-plan.
+tables did — capture `modem_state` + a PMU dump and re-plan. For that next
+level of depth: `~/Desktop/modem-cross-compiler-linux.tar.gz` has a
+`mips-elf-` toolchain (the xcpu is MIPS — see the mkimage headers), so
+`mips-elf-objdump -D` on the `Modem work codes` payload can recover what the
+modem's own `SYS_PM_CMD_EN`/`AUX_CLK` handlers write to the PMU.
+
+### Hard-won driver lesson (2026-07-23, found by the modemless control boot)
+
+The dpram ring-ctrl words are uninitialized SRAM on a modemless boot: the
+first driver version read a garbage `head` (`0x2f31a6f2`), indexed it
+unmasked into the 512-byte tx ring, and oopsed in `memcpy_toio` — killing
+init at 0.87 s. Fixed by masking every head/tail read AND gating the probe
+handshake on `mdsys_rings_sane()` (all four pointers in-range and aligned;
+the bootloader zeroes them when it inits mdcom). Never trust dpram contents
+that only a modem-aware bootloader initializes.
