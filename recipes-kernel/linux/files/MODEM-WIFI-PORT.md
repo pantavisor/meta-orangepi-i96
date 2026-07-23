@@ -1,9 +1,23 @@
 # Orange Pi i96 (RDA8810PL) — Modem / WiFi bring-up port plan
 
-Status: **scoped, not started.** This is the design/starting doc for the WiFi
-bring-up effort. WiFi stages 1–2 (I2C + combo power driver) are already built and
-merged into the kernel patch series (`rda-mmc-15..18`); they are blocked on the
-one hardware fact captured here.
+Status: **stage 2 solved (pinmux); stage 3 needs the modem after all.**
+
+- **Stage 2 (I2C control) — DONE.** Not a modem problem: two pinmux bits. See §10.
+- **Stage 3 (SDIO data) — BLOCKED, cause identified §11.** The vendor u-boot loads
+  a 2 MB `modem.bin` and starts the modem coprocessor *before* booting Linux. We
+  never have. The RDA5991's I2C slave runs without it, but its digital core needs
+  the modem-gated 26 MHz, so SDIO never answers. §1 was right about the modem —
+  it was only wrong about which interface the modem gates.
+
+Original (now partly superseded) status: **SOLVED — and it was not the modem.** The RDA5991_G answers I2C from
+u-boot with `project_id 0x5991, chip_version 0x47`, matching the vendor image
+exactly. The blocker was never power, the PMU, or the modem coprocessor: I2C1's
+SCL/SDA pads come out of reset muxed to the GPIO block, so every transfer NAKed.
+Two bits in `AP_GPIO_B_Mode` fix it. See [§10](#10-resolution-it-was-pinmux).
+
+Sections 1–5 below are preserved as written *before* that was known. They are
+wrong about the cause, and deliberately left in place: the reasoning that led to
+the wrong answer is the most useful part of this document.
 
 Sibling memories: `i96-wifi-bringup-state`, `rda8810-linux-mmc-backport`,
 `i96-bsp-layer-extraction`.
@@ -134,7 +148,7 @@ Key AP↔modem register bases (from the u-boot iomap): modem mailbox
 
 ## 5. Strategies (cheapest first — verify A′ before committing to B)
 
-### A′. u-boot ISPI shortcut — *try this first, ~1 day*
+### A′. u-boot ISPI shortcut — *implemented, see §9*
 **Hypothesis:** we own our u-boot completely and the vendor u-boot already
 talks to the PMU **directly over ISPI** (no modem needed at boot). If we, in our
 u-boot board init, use `ispi_open`/`pmu_reg_write` to (1) enable the `v_bt`/WiFi
@@ -147,9 +161,17 @@ and the Linux `regulator`/`msys` layer is replaced by "u-boot latched it on".
   bit or a SoC pad the modem drives. If it's a plain SoC pad, even easier (GPIO
   in u-boot). If it is only reachable through a modem msys command, A′ fails and
   we fall to A/B.
+  - *Update:* re-reading `rda_combo_power_main.c` weakens this risk a lot.
+    `rda_combo_power_ctrl_init()` calls `wlan_read_version_from_chip()` with
+    **no** `regulator_enable()` and **no** `clk_prepare_enable()` — the chip
+    ACKs at 1.2 s purely because something already switched it on. The only
+    "something" in the vendor log is the msys regulator bring-up at 0.37 s
+    (`v_bt … 1800 mV`). So the I2C-ACK milestone probably needs **only the
+    supply**; the 26 MHz XEN question belongs to stage 3/4 (RF), not here.
 - **First experiment:** port just the ISPI helpers + the vendor's `v_bt` LDO
   enable and `26M` enable into our u-boot `board_init`, boot our normal
-  pantavisor image, check for `rda_combo … chip version 0x47`.
+  pantavisor image, check for `rda_combo … chip version 0x47`. — **done, plus an
+  in-u-boot I2C path so the check no longer costs a Linux boot; see §9.**
 
 ### A. Load modem fw + minimal msys client — *medium, ~3–5 days*
 Port only what is needed to (1) load the `Modem work codes` blob into reserved
@@ -185,7 +207,7 @@ the SD/MMC bring-up.
   (`drivers/net/wireless/rdaw80211/rdawlan/`, ~180 KB `wland_cfg80211.c` + bus
   layer) to 6.6. This is the second-largest piece after the modem.
 
-## 8. Definition of done
+## 8. Definition of done (WiFi)
 `ip link` shows a `wlan0`; `iw dev wlan0 scan` returns APs; a WPA2 association +
 DHCP succeeds — matching the vendor log's `wland_cfg80211_up: dongle up`.
 
@@ -198,3 +220,358 @@ networkctl status wlan0
           Driver: rdawfmac               ← the rdawlan cfg80211 driver's netdev
       HW Address: 82:6b:41:3a:0a:48      (random — nvram has no MAC; see log)
 ```
+
+---
+
+## 9. What A′ is now (strategy A′ implementation)
+
+All of this lives in the u-boot stage-2 port,
+`recipes-bsp/u-boot/files/rda8810-stage2/`. It builds clean against u-boot
+2024.01 with `arm-linux-gnueabi-gcc 13.2` in three configurations (commands
+only, `RDA_COMBO_POWER_AUTO=y`, and `RDA_COMBO_POWER=n`), with no warnings.
+**None of it has run on hardware yet.**
+
+| File | What it is |
+|------|-----------|
+| `arch/arm/include/asm/arch-rda/rda_ispi.h` | ISPI API: `rda_ispi_open/read/write`, `rda_pmu_read/write/update` |
+| `arch/arm/mach-rda/rda_ispi.c` | Vendor-exact ISPI transport (`CONFIG_RDA_ISPI`), all spin loops bounded |
+| `drivers/i2c/rda_i2c.c` | DM I2C master (`CONFIG_RDA_I2C`), same engine as our Linux `rda-i2c` |
+| `board/rda/rda8810pl/rda_combo.c` | `rdapmu` + `rdacombo` commands and the latch (`CONFIG_RDA_COMBO_POWER`) |
+| DT | `i2c1/2/3` nodes in `rda8810pl.dtsi`; `i2c1` enabled with the four combo clients on the i96 |
+
+### Why the PMU is reachable at all
+`RDA_MODEM_SPI2_BASE = 0x11a14000` is inside the modem register window but is
+AP-addressable, and the **vendor SPL we already boot** programs the PMU through
+it (`board/rda/rda8810/clock.c pmu_setup_init` → `ispi_open(1)` →
+`pmu_reg_write`). With no modem firmware running, nothing contends for the port,
+so stage-2 (and, if it ever helps, Linux) can keep using it. The vendor Linux
+`arch/arm/plat-rda/ispi.c` only ever opens port 0 (AP analog) — that is the
+whole reason the kernel has to go through mdcom/msys.
+
+### The one unknown, and how the search closes it
+RDA never published a PMU register map; the AP sources name LDOs only by an
+opaque msys `pm_id` (`v_bt` = 10, from `regulator-devices.c`). The single leak is
+the vendor u-boot's `board/rda/common/i2c_test.c touch_sensor_power_init()`,
+which switches an LDO on with:
+
+```c
+0x07 &= ~(1<<13);   /* select vol > 2V  (setting it selects < 2V) */
+0x28 |=  (1<<13);   /* enable power in normal mode */
+0x29 |=  (1<<13);   /* enable power in LP mode */
+```
+
+Three registers, **the same bit position** in each — and the LDO it powers is the
+touch sensor's, i.e. `v_i2c`, whose `pm_id` is **13**. Hence the working
+hypothesis encoded in `rda_combo_power_seq[]`: bit position == `pm_id`, so `v_bt`
+is bit **10** of `0x07`/`0x28`/`0x29`, at the `< 2V` range (the vendor log reports
+`v_bt` at 1800 mV). *This is a guess.* If it is wrong, `rdacombo scan` finds the
+real bit by setting one currently-clear bit at a time across PMU `0x00..0x3f`,
+pinging the chip, and restoring the register — skipping the core/DDR/charger
+rails (`0x03 0x05 0x0d 0x0f 0x12 0x13 0x2a 0x2d 0x2e 0x2f 0x36`) that the SPL
+programs and that would brown the board out.
+
+### Bench procedure
+At the u-boot prompt on the i96:
+
+```
+=> i2c dev 0
+=> i2c probe                  # expect: nothing (chip is dark)
+=> rdapmu dump 0x00 0x40      # baseline; save this
+=> rdacombo id                # expect: "does not answer"
+=> rdacombo on                # apply the hypothesis
+=> rdacombo id                # HOPED FOR: project_id 0x5991 chip_version 0x0047
+```
+
+If `rdacombo on` does not wake it:
+
+```
+=> rdacombo scan              # sweeps 0x00..0x3f, prints "HIT — pmu[0xRR] bit N"
+```
+
+A hit is the answer: put that `(reg, bit)` into `rda_combo_power_seq[]`, turn on
+`CONFIG_RDA_COMBO_POWER_AUTO` so `board_init()` latches it on every boot, and
+Linux should then print `rda_combo … read project_id:5991 version:47` from the
+already-merged kernel patches 15–18 with no kernel change at all.
+
+If the scan comes up empty, the supply is not a single PMU bit and the next
+moves are, in order: (1) diff a full `rdapmu dump` against one taken from the
+vendor SPL prompt, (2) check whether the 26 MHz `XEN`/`BT_RF_CLKEN` gate really
+is required for the I2C block (`md_sysctrl` `Cfg_Clk_Out` @ `0x11a00054` and
+`Cfg_Clk_Auxclk` @ `0x11a0005c` are plain MMIO — poke them with `mw`), and only
+then (3) fall back to strategy A.
+
+### Deliberately not done
+- No `md_sysctrl` clock command: those registers are ordinary MMIO, so `md`/`mw`
+  already cover them (`CONFIG_CMD_MEMORY` is now on in the defconfig).
+- `CONFIG_RDA_COMBO_POWER_AUTO` is **off**. Until the bench confirms the bit, a
+  bootloader should not poke a guessed PMU register on every boot unattended.
+- No clock driver: stage-2 has none, so `rda_i2c` takes the APB1 rate from a
+  `rda,apb-clock-hz` DT property (200 MHz, the value the vendor u-boot hardcodes
+  for the same block) instead of a `clocks` phandle.
+
+---
+
+## 10. RESOLUTION: it was pinmux
+
+Confirmed on hardware 2026-07-22, at the u-boot prompt:
+
+```
+=> md.l 0x11a09010 1
+11a09010: ffffffff              <- AP_GPIO_B_Mode: every pad in GPIO mode
+=> i2c probe
+Valid chip addresses:           <- nothing
+=> mw.l 0x11a09010 0x3fffffff   <- clear bits 30/31 only
+=> i2c probe
+Valid chip addresses: 14 16
+=> rdacombo id
+rdacombo: project_id 0x5991 chip_version 0x0047  (RDA5991_G - expected part)
+```
+
+`0x5991 / 0x47` is byte-for-byte the vendor Debian log's
+`read project_id:5991 version:47`. No modem, no mdcom, no msys, no PMU write.
+
+### Why
+
+Vendor board file `tgt_gpio_setting.h`:
+
+```c
+#define AS_ALT_FUNC 0        /* 0 = alternate function */
+#define AS_GPIO     1        /* 1 = plain GPIO         */
+// GPIO(30) // I2C1_SCL:nil-nil-nil
+#define TGT_AP_HAL_GPIO_B_30_USED AS_ALT_FUNC
+// GPIO(31) // I2C1_SDA:nil-nil-nil
+#define TGT_AP_HAL_GPIO_B_31_USED AS_ALT_FUNC
+```
+
+I2C1 (bus 0, `_TGT_AP_I2C_BUS_ID_WIFI = 0` → `RDA_I2C1_PHYS 0x20950000`) is on
+AP GPIO_B bits 30/31, and those must read **0** to reach the controller. Ours
+read 1. The controller therefore clocked address bytes into unconnected pads and
+saw no ACK — which, from the AP side, is *identical* to a chip with no supply.
+Every symptom in §1 follows from that.
+
+The polarity is independently proven by something that already worked: the SD
+card is on GPIO_C 9..14 and `BB_GPIO_Mode` (`0x11a09008` = `0x7fff81ff`) has
+those bits clear, which is why u-boot can load a kernel at all.
+
+### Confirmed in Linux too
+
+With `CONFIG_RDA_COMBO_POWER_AUTO=y` the mux is applied in `board_init()` and
+survives the handoff, so the already-merged kernel patches 15-18 work unchanged:
+
+```
+[ 0.880000] rda_combo: RDA5991 chip version 0x47 (wlan_version 6)
+[ 1.940000] rda_combo 0-0016: wifi powered on
+[ 1.940000] rda-i2c 20950000.i2c: RDA I2C adapter at 0x20950000
+```
+
+`wlan_version 6` is `WLAN_VERSION_91_G`, matching the vendor image, and "wifi
+powered on" means the full `rda_5991g` power-on tables ran over I2C -- not just
+the id read. **Stage 2 is complete.** The original `-6` was this same bus.
+
+### The fix, and where it lives
+
+`board/rda/rda8810pl/rda_combo.c` `rda_combo_pinmux()`, called from
+`board_init()` with `CONFIG_RDA_COMBO_POWER_AUTO=y` (now on by default). It
+clears the two bits and leaves them cleared, so **Linux inherits a working
+I2C1** — which matters, because our 6.6 `rda-i2c` driver has no pinctrl and
+mainline has no RDA pinctrl driver at all. The original `-6` from `rda_combo` in
+Linux was almost certainly this same disconnected bus, not a power problem.
+
+`rda_combo_clocks()` additionally enables `Cfg_Clk_Auxclk` (26 MHz, `0x11a0005c`
+bit 0) and `Cfg_Clk_Out` (32 kHz, `0x11a00054`, behind the `REG_DBG` protect
+unlock `0xA50001`) — the two clocks the vendor combo driver requests via msys.
+The chip answers I2C without them; they are enabled for the stage-3/4 RF path.
+
+### What was wrong in §1–§5, and what was right
+
+Wrong: the root-cause claim that the supply and 26 MHz enable are modem-owned
+and unreachable from the AP. The chip's VBAT/VIO are always-on; nothing needed
+switching.
+
+Right, and still valuable:
+- **The PMU is AP-reachable with no modem running.** `rdapmu dump` returned a
+  map that matches the vendor SPL's `pmu_setup_init()` writes register for
+  register (`0x03`=`9fff`, `0x0d`=`92d0`, `0x0f`=`1e90`, `0x12`=`1218`,
+  `0x2a`=`aab5`, `0x2d`=`96ba`, `0x2e`=`12aa`, `0x2f`=`9444`, `0x36`=`6e54`),
+  and writes land and read back. That is the first PMU map anyone has for this
+  SoC, and strategies A/B never have to be attempted for WiFi.
+- `CHIP_ID 0x8810001c` (metal id 28) cross-checks the PMU's metal-id-dependent
+  branches.
+- The u-boot I2C master, which is what made the answer findable in seconds.
+
+### Methodological lesson (the expensive one)
+
+`rdacombo scan` swept ~500 live PMU bits and reported "no bit woke the chip".
+That negative was **worthless**: the detection path was itself broken, so no bit
+could ever have registered as a hit. A search with no positive control cannot
+produce a valid negative. The pinmux should have been verified *before* the
+scan, not after it. `rdacombo scan`'s failure message now says so.
+
+### Remaining work
+
+- **Stage 3:** enable SDIO on `mmc@60000`, expect `mmc1: new SDIO card` +
+  `Chipid: 0x6(RDA5991_G)`.
+- **Stage 4:** port the `rdawlan` cfg80211 SDIO driver to 6.6.
+- Addresses `0x13`/`0x15` (wifi_core / bt_core) stay quiet until the vendor
+  `power_on` tables run — expected, not a fault.
+- Consider a proper kernel-side pinmux (DT node or a small RDA pinctrl driver)
+  so the mux does not depend on this bootloader.
+
+---
+
+## 11. Stage 3: the modem IS required (found 2026-07-22)
+
+§10 concluded "no modem needed". That is true for the I2C control interface and
+**wrong for SDIO**. The evidence came from mounting the official OrangePi i96
+Debian SD card read-only and reading its `/boot/boot.cmd`:
+
+```
+setenv init_modem "yes"
+ext2load mmc 0:1 ${modem_addr} modem.bin
+if test "${init_modem}" = "yes"; then
+        mdcom_loadm ${modem_addr}
+        mdcom_check 1
+fi
+bootz ${kernel_addr} ${initrd_addr}
+```
+
+The vendor bootloader loads the modem firmware and starts the coprocessor before
+Linux runs. Ours never does. `/boot/modem.bin` is exactly 2 MiB and holds the two
+images §3 predicted:
+
+| offset | size | load | entry | name |
+|--------|------|------|-------|------|
+| `0x000000` | 2064 | `0x01c16000` | `0x81c16000` | `Modem raminit codes` |
+| `0x000850` | 2003744 | `0x02000800` | `0x82000800` | `Modem work codes` |
+
+The vendor rootfs only auto-loads `rdawfmac` (`/etc/modules`); nothing there
+starts the modem, so u-boot is the only place it happens.
+
+### Why this explains stage 3 exactly
+
+The RDA5991's I2C slave is a simple always-on register block — it answers with no
+modem, which is why stage 2 works. Its **digital core**, which must respond to
+CMD5, needs the 26 MHz reference gated by `CLK26M_REQUEST`/`XEN` — managed by the
+modem through msys `SYS_GEN_CMD_AUX_CLK` / `SYS_PM`. With no modem the core is
+unclocked: no SDIO response, while `DAT3_VAL` still reads high because the IO
+ring is powered. Every measurement in the stage-3 investigation fits this.
+
+Ruled out first, each by direct hardware read (see git history for detail): pad
+mux (`BB_GPIO_Mode=0x7FE001FF`), SDMMC2 clock gate (`APB2=0x001FFFFF`, bit 17
+set), low-frequency clocks (`Cfg_Clk_Out=0x200`, `Cfg_Clk_Auxclk=1`), `ocr_avail`
+and all timing params (identical to vendor), `mclk-adj` 1 vs 3 (tested live via
+u-boot `fdt set`, no change), controller clocking (`TRANS_SPEED=0x63` ≈ 1 MHz
+init clock), settling time (re-probe 17 s after power-on), and completeness of the
+combo power-on (all nine vendor steps report success).
+
+### The work
+
+Strategy A from §5: port `mdcom_loadm` + `mdcom_check` into our u-boot 2024.01
+stage-2. Vendor sources: `common/cmd_mdcom.c` (33 KB) and
+`arch/arm/cpu/armv7/rda/mdcom.c` (22 KB) from
+`OrangePiLibra/OrangePi_i96_uboot@ac251146`. The DT must also reserve the modem
+DRAM region so Linux does not use it.
+
+**Licensing:** `modem.bin` is proprietary RDA firmware. It must NOT be committed
+to meta-pantavisor or meta-orangepi-i96. Fetch it from the vendor image at build
+time or require the user to supply it, as other BSPs do for closed firmware.
+
+---
+
+## 12. NEXT SESSION: START HERE
+
+### State in one paragraph
+Stage 2 (I2C control of the RDA5991_G) is **done and on hardware** — the chip
+reports `project_id 0x5991 / chip_version 0x47` and the full nine-step vendor
+power-on sequence succeeds. Stage 3 (SDIO data path) is **blocked**: every SDIO
+command times out. The cause is *not* any of the nine things listed in §11, and
+it is *not* simply "the modem isn't running" — that was tested directly and
+disproved (below). The one remaining untested hypothesis is the **AP-side msys
+client**.
+
+### The single most important experiment already done
+Booted the **vendor** SD card, used its u-boot's own `mdcom_loadm`/`mdcom_check`
+to start the modem coprocessor, hand-applied our two pinmux writes, then booted
+**our** 6.6 kernel from that card (via `CONFIG_ARM_APPENDED_DTB`, because vendor
+u-boot 2012.04 has no `fdt` command). Everything came up — modem interface
+version `0x00010001`, I2C alive, all nine power-on steps `succeed!!` — and
+`mmc1` still failed identically.
+
+**Conclusion: starting the modem is necessary-at-most, not sufficient.** Do NOT
+spend days porting `mdcom_loadm` to our u-boot expecting it to fix WiFi.
+
+### The next step
+Strategy A had two halves. Half (1), starting the xcpu, is now known
+insufficient. Half (2) is untested and is the leading hypothesis:
+
+> a minimal Linux mdcom + **msys client** that sends `SYS_PM_CMD_EN` (v_bt /
+> v_wifi) and `SYS_GEN_CMD_AUX_CLK` / `SYS_GEN_CMD_CLK_OUT` (26 MHz / 32 kHz)
+
+The modem only switches those rails when the AP *asks* it over msys. Our
+`rda_combo` port stubs exactly those calls (`enable_26m_rtc`,
+`enable_26m_regulator`, `enable_32k_rtc`) out — see the patch-17 header. So the
+combo chip's 26 MHz may still be off even with the modem running, which would
+leave its digital core unclocked and its SDIO block mute while the always-on I2C
+slave answers fine. That matches every observation.
+
+IDs needed for the port (from `plat/md_sys.h`):
+
+| symbol | value |
+|--------|-------|
+| `SYS_GEN_MOD` | `0x0` |
+| `SYS_PM_MOD` | `0x2` |
+| `SYS_GEN_CMD_CLK_OUT` | `0x1004` |
+| `SYS_GEN_CMD_AUX_CLK` | `0x1005` |
+| `SYS_PM_CMD_EN` | `0x1001` |
+
+`v_bt` is msys `pm_id` 10 (`arch/arm/mach-rda/regulator-devices.c`).
+
+Sources: `arch/arm/plat-rda/md.c` (mdcom core), `md_sys.c` (msys, 31 KB),
+`modem_xcpu.c`, `comreg0_misc.c`, `smd.c` from
+`OrangePiLibra/OrangePi_i96_kernel@74c4ea44`. Note msys is a real protocol —
+slots, sequence numbers, async completions, an rx workqueue — so hand-crafting
+frames over the vendor u-boot's `mdcom_send` command is **not** a cheap shortcut;
+it is the port itself.
+
+Also required for a full solution: our u-boot must load `modem.bin` and start the
+xcpu (half 1) before Linux, since the msys client needs a running modem to talk
+to. `modem.bin` is **proprietary** — see the licensing note in §11.
+
+### Cheap things worth doing first, independent of WiFi
+1. **CMA is broken.** `OF: reserved mem: failed to allocate memory for node
+   'linux,cma': size 32 MiB` → falls back to 64 MiB outside the IFC DMA window,
+   so both mmc controllers warn about their bounce buffer. Patch 12 is not doing
+   its job. Latent DMA-correctness risk on the *working* SD controller.
+2. **Our DT overclaims RAM.** We declare 256 MB; the vendor reports `DRAM: 236
+   MiB` (`_TGT_AP_OS_MEM_SIZE=236`, top 20 MB reserved for CAM 4 MB + VPU 16 MB).
+3. **`package-bootloader.sh` is broken** — it calls `mkrdaimage.sh` with 3 args
+   where the vendor script takes 5, and the committed `u-boot-spl.bin` differs
+   from the SPL inside the working `.rda` by 40 bytes. The working blob is built
+   by reusing the first `0x12000` bytes of the existing
+   `rda8810-spl/bootloader-hybrid-debuguart.rda` and appending a freshly
+   `mkimage`d `u-boot.img` (`-A arm -O u-boot -T firmware -a/-e 0x80008000`).
+   That `.rda` is deliberately **not** tracked; regenerate it that way.
+
+### Bench aids that now exist
+- `rdapmu dump|read|write` — raw PMU over ISPI. The map validated against the
+  vendor SPL's writes register-for-register, so it is trustworthy.
+- `rdacombo id|on|scan` — chip id, apply the pad mux + clocks, brute-force a PMU bit.
+- **Fast loop, no reflash** (needs patch 21, which is in):
+  ```
+  devmem <reg> 32 <val>
+  echo 20a60000.mmc > /sys/bus/platform/drivers/rda-mmc/unbind
+  echo 20a60000.mmc > /sys/bus/platform/drivers/rda-mmc/bind
+  dmesg | tail
+  ```
+- **Boot our kernel from the vendor card** (for anything needing the modem):
+  put `pv-zImage-dtb` (zImage with dtb concatenated) and `pv-uInitrd` on the
+  vendor BOOT partition, then at its prompt run modem init, the two pinmux `mw.l`
+  writes, and `bootz ${kernel_addr} ${initrd_addr}`.
+
+### Method note, learned the hard way this session
+Two searches in this effort produced confident but worthless negatives because
+the *detection path* was broken — a PMU bit-sweep run while the I2C bus was
+unmuxed, and a "no FDT" kernel hang misread as a modem failure. **Verify the
+instrument before believing a negative result.** Where possible use a positive
+control: mmc0 runs the same driver as mmc1 and diffing their live registers was
+worth more than any amount of reasoning.
