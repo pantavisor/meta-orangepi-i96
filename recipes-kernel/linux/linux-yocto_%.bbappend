@@ -56,3 +56,12 @@ SRC_URI:append:orangepi-i96 = " \
     file://rda-mmc-24-arm-dts-orangepi-i96-enable-mdsys-fix-ram-cma.patch \
     file://rda-mmc-25-wifi-rda-combo-clocks-ldo-via-msys.patch \
 "
+
+# WiFi stage 4: the rdawlan cfg80211 driver, giving an actual wlan0. The SDIO
+# data path itself came up in stage 3 (the fix was the pad map in u-boot, see
+# MODEM-WIFI-PORT.md section 15); this is the driver that binds to the
+# enumerated SDIO function.
+SRC_URI:append:orangepi-i96 = " \
+    file://rda-mmc-26-wifi-rdawlan-import-vendor-driver.patch \
+    file://rda-mmc-27-wifi-rdawlan-forward-port-to-6.6.patch \
+"

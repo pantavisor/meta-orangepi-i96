@@ -9,7 +9,7 @@ Status: **stages 2 and 3 DONE — both were pinmux. No modem needed. See §15.**
   vendor Debian reports. **The modem is NOT required for WiFi**, so
   `mdcom_loadm` never needs porting and `modem.bin`'s proprietary licensing
   is a non-issue. §11's "the modem gates the 26 MHz" conclusion was wrong.
-- **Stage 4 (`rdawlan` cfg80211 port) — next.** Nothing else blocks it.
+- **Stage 4 (`rdawlan` cfg80211 port) — driver builds, see §16.** Not yet run on hardware.
 
 Original (now partly superseded) status: **SOLVED — and it was not the modem.** The RDA5991_G answers I2C from
 u-boot with `project_id 0x5991, chip_version 0x47`, matching the vendor image
@@ -826,3 +826,92 @@ The kernel has no RDA pinctrl driver, so this lives in the bootloader and
 depends on it. A DT-driven pinctrl driver is the correct home and is the
 natural upstream story; until then, anyone booting a different bootloader must
 replicate these five writes.
+
+
+---
+
+## 16. Stage 4: the rdawlan driver builds for 6.6 (2026-07-24)
+
+Patches 26 (verbatim vendor import) and 27 (the forward-port) put a
+`CONFIG_RDAWFMAC=y` cfg80211 driver in the kernel. It compiles and links
+clean. **It has not been run on hardware yet** — that is the next bench step.
+
+### Scope
+
+Station only. Dropped from the vendor build: USB, BT-AMP, P2P (already off in
+the vendor's own `wland_defs.h`), wireless-extensions (`wland_iw.c`), Android
+private commands, monitor mode. That removes ~200 KB of the most API-rotted
+code and none of it is needed for `wlan0` + scan + WPA2.
+
+The chip "firmware" is a table of register patches compiled in from
+`wland_trap_91g.h`, **not a blob**, and the driver is under a permissive
+ISC-style licence — so nothing is fetched at runtime and there is no
+redistribution question, unlike `modem.bin`.
+
+### The migrations (all in patch 27)
+
+timers (`init_timer` → `timer_setup`/`from_timer`), cfg80211 op signatures
+(`add_virtual_intf` gained `name_assign_type` and lost `flags`, key ops gained
+`link_id`, `get_station` takes a const MAC), cfg80211 calls (`inform_bss`
+gained a frame type, `disconnected` gained `locally_generated`, `ibss_joined`
+gained a channel, `scan_done`/`roamed` take parameter structs), enum renames
+(`IEEE80211_BAND_*`, `STATION_INFO_*`, `IEEE80211_CHAN_NO_IBSS`), netdev
+(`last_rx`/`trans_start` gone, `netif_rx_ni` folded in, `tx_timeout` gained a
+queue index, `alloc_netdev` gained a name-assign type), and VFS
+(`set_fs`/`KERNEL_DS` gone → `kernel_read`/`kernel_write`).
+
+Also: the driver defined **42 static functions in the kernel's own
+`cfg80211_*` namespace**, which now collides (`cfg80211_get_station`). They
+are renamed `wland_cfg80211_*`.
+
+### Bugs caught by independent review, not by the compiler
+
+Two external models (opencode/kimi and agy/Gemini) reviewed the semantic
+decisions. Four real defects came out of it, three of them introduced by the
+port itself:
+
+1. **`locally_generated` was wrong.** A blanket regex passed `true` at the
+   `WLAND_E_DISCONNECT_IND` site, which is the *firmware* reporting that the
+   AP deauthenticated us — the opposite of locally generated. Userspace would
+   have been told the wrong thing about every AP-side disconnect.
+2. **`REGULATORY_CUSTOM_REG` went into the wrong field.** Renaming
+   `WIPHY_FLAG_CUSTOM_REGULATORY` kept `wiphy->flags |=`; the constant belongs
+   in `wiphy->regulatory_flags`. It compiled and set a meaningless bit.
+3. **`.start_ap`/`.change_beacon` were left registered after `.stop_ap` was
+   dropped**, and `BIT(NL80211_IFTYPE_AP)` was still advertised — userspace
+   could have started an AP with no way to stop it. All three removed.
+4. **`kernel_read()` argument order** in `linux_osl.c` was the pre-4.14 form
+   (dead code here, but header-exported and wrong).
+
+Worth recording as method: the compiler proved nothing about any of these.
+A second reader with fresh eyes on *the decisions* — not the diff — found
+them in one pass.
+
+Not everything reported was real: a claimed use-after-free of the watchdog
+timer/kthread on remove was checked against the code and the teardown does
+happen, via `wland_sdio_bus_stop()`. Agent findings need verifying like any
+other claim.
+
+### Known limitations, deliberate
+
+- **No `mgmt_tx`.** Fine for WPA2-PSK on a full-MAC part (auth/assoc are in
+  firmware, EAPOL rides the data path), but it will need porting for 802.11w
+  MFP (SA Query), 802.11r FT, or WNM.
+- **No scheduled scan**; wpa_supplicant falls back to normal scans.
+- **RSSI is instantaneous**, not averaged — the averaging cache lives in the
+  `wland_iw.c` we do not build.
+- `rda_mmc_set_sdio_irq()` is a no-op shim. The vendor host exported it to
+  mask the SDIO IRQ; mainline governs delivery through the driver's own
+  `sdio_claim_irq()`/`sdio_release_irq()`. If spurious interrupts appear in
+  the windows the vendor masked, release/re-claim there rather than reaching
+  into the host driver.
+- Pre-existing vendor issues left alone, worth a look if the remove path is
+  ever exercised: `sdio_claim_irq()` is not released on one error path, and
+  `cfg80211_inform_bss()` is called under `cfg->scan_result_lock`.
+
+### Next bench step
+
+Flash and boot, then look for the SDIO function binding to `rdawfmac` after
+`mmc1: new SDIO card`, a `wlan0` in `ip link`, and `iw dev wlan0 scan`
+returning APs. Definition of done is unchanged from §8: WPA2 association plus
+DHCP.
