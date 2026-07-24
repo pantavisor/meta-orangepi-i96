@@ -1,23 +1,50 @@
-wifi: add RDA599x combo chip power controller (rdacombodev)
-
-Forward-port of the vendor rdacombodev power/identification driver for
-the RDA599x WiFi+BT combo chip (Orange Pi i96). The per-chip power
-sequence tables (rda_5990/5991/e/f/g) are verbatim vendor code; the main
-controller is rewritten for DT-based I2C client instantiation. The
-vendor's modem-PMU-backed 26M/32k/LDO management is stubbed (modem
-firmware keeps the shared clocks up); verified by the chip version read
-at probe. WiFi is powered on at probe as a bring-up aid until the
-rdawlan driver takes control.
+From e662fb911db9a6897620931545d59f7dce7f05c9 Mon Sep 17 00:00:00 2001
+From: invalid_git config <unknown@unknown>
+Date: Fri, 24 Jul 2026 18:19:56 +0000
+Subject: [PATCH 1/9] Forward-port of the vendor rdacombodev
+ power/identification driver for the RDA599x WiFi+BT combo chip (Orange Pi
+ i96). The per-chip power sequence tables (rda_5990/5991/e/f/g) are verbatim
+ vendor code; the main controller is rewritten for DT-based I2C client
+ instantiation. The vendor's modem-PMU-backed 26M/32k/LDO management is
+ stubbed (modem firmware keeps the shared clocks up); verified by the chip
+ version read at probe. WiFi is powered on at probe as a bring-up aid until
+ the rdawlan driver takes control.
 
 Upstream-Status: Inappropriate [local forward-port of vendor driver]
 
 Signed-off-by: Sergio Marin <sergio.marin@pantacor.com>
 ---
+ drivers/net/wireless/Kconfig                  |    2 +
+ drivers/net/wireless/Makefile                 |    1 +
+ drivers/net/wireless/rdaw80211/Kconfig        |    2 +
+ drivers/net/wireless/rdaw80211/Makefile       |    2 +
+ .../wireless/rdaw80211/rdacombodev/Kconfig    |    8 +
+ .../wireless/rdaw80211/rdacombodev/Makefile   |   10 +
+ .../rdacombodev/rda_5990_power_ctrl.c         | 1365 +++++++++++++++++
+ .../rdacombodev/rda_5991_power_ctrl.c         |  773 ++++++++++
+ .../rdacombodev/rda_5991e_power_ctrl.c        |  847 ++++++++++
+ .../rdacombodev/rda_5991f_power_ctrl.c        |  811 ++++++++++
+ .../rdacombodev/rda_5991g_power_ctrl.c        |  891 +++++++++++
+ .../rdaw80211/rdacombodev/rda_combo.h         |  205 +++
+ .../rdacombodev/rda_combo_power_main.c        |  403 +++++
+ 13 files changed, 5320 insertions(+)
+ create mode 100644 drivers/net/wireless/rdaw80211/Kconfig
+ create mode 100644 drivers/net/wireless/rdaw80211/Makefile
+ create mode 100644 drivers/net/wireless/rdaw80211/rdacombodev/Kconfig
+ create mode 100644 drivers/net/wireless/rdaw80211/rdacombodev/Makefile
+ create mode 100644 drivers/net/wireless/rdaw80211/rdacombodev/rda_5990_power_ctrl.c
+ create mode 100644 drivers/net/wireless/rdaw80211/rdacombodev/rda_5991_power_ctrl.c
+ create mode 100644 drivers/net/wireless/rdaw80211/rdacombodev/rda_5991e_power_ctrl.c
+ create mode 100644 drivers/net/wireless/rdaw80211/rdacombodev/rda_5991f_power_ctrl.c
+ create mode 100644 drivers/net/wireless/rdaw80211/rdacombodev/rda_5991g_power_ctrl.c
+ create mode 100644 drivers/net/wireless/rdaw80211/rdacombodev/rda_combo.h
+ create mode 100644 drivers/net/wireless/rdaw80211/rdacombodev/rda_combo_power_main.c
 
 diff --git a/drivers/net/wireless/Kconfig b/drivers/net/wireless/Kconfig
+index 7555af5195ec..536190f78091 100644
 --- a/drivers/net/wireless/Kconfig
 +++ b/drivers/net/wireless/Kconfig
-@@ -37,6 +37,8 @@ source "drivers/net/wireless/ti/Kconfig"
+@@ -38,6 +38,8 @@ source "drivers/net/wireless/ti/Kconfig"
  source "drivers/net/wireless/zydas/Kconfig"
  source "drivers/net/wireless/quantenna/Kconfig"
  
@@ -27,9 +54,10 @@ diff --git a/drivers/net/wireless/Kconfig b/drivers/net/wireless/Kconfig
  
  source "drivers/net/wireless/virtual/Kconfig"
 diff --git a/drivers/net/wireless/Makefile b/drivers/net/wireless/Makefile
+index 4d7374d567d1..a05862da2e8b 100644
 --- a/drivers/net/wireless/Makefile
 +++ b/drivers/net/wireless/Makefile
-@@ -18,6 +18,7 @@ obj-$(CONFIG_WLAN_VENDOR_SILABS) += silabs/
+@@ -22,6 +22,7 @@ obj-$(CONFIG_WLAN_VENDOR_SILABS) += silabs/
  obj-$(CONFIG_WLAN_VENDOR_ST) += st/
  obj-$(CONFIG_WLAN_VENDOR_TI) += ti/
  obj-$(CONFIG_WLAN_VENDOR_ZYDAS) += zydas/
@@ -39,6 +67,7 @@ diff --git a/drivers/net/wireless/Makefile b/drivers/net/wireless/Makefile
  obj-$(CONFIG_WLAN) += virtual/
 diff --git a/drivers/net/wireless/rdaw80211/Kconfig b/drivers/net/wireless/rdaw80211/Kconfig
 new file mode 100644
+index 000000000000..024d2cc0168a
 --- /dev/null
 +++ b/drivers/net/wireless/rdaw80211/Kconfig
 @@ -0,0 +1,2 @@
@@ -46,6 +75,7 @@ new file mode 100644
 +source "drivers/net/wireless/rdaw80211/rdacombodev/Kconfig"
 diff --git a/drivers/net/wireless/rdaw80211/Makefile b/drivers/net/wireless/rdaw80211/Makefile
 new file mode 100644
+index 000000000000..93a5e5047f0a
 --- /dev/null
 +++ b/drivers/net/wireless/rdaw80211/Makefile
 @@ -0,0 +1,2 @@
@@ -53,6 +83,7 @@ new file mode 100644
 +obj-$(CONFIG_RDA_COMBO)	+= rdacombodev/
 diff --git a/drivers/net/wireless/rdaw80211/rdacombodev/Kconfig b/drivers/net/wireless/rdaw80211/rdacombodev/Kconfig
 new file mode 100644
+index 000000000000..c69f257558ab
 --- /dev/null
 +++ b/drivers/net/wireless/rdaw80211/rdacombodev/Kconfig
 @@ -0,0 +1,8 @@
@@ -66,6 +97,7 @@ new file mode 100644
 +	  four I2C clients. Required by the rdawlan SDIO WiFi driver.
 diff --git a/drivers/net/wireless/rdaw80211/rdacombodev/Makefile b/drivers/net/wireless/rdaw80211/rdacombodev/Makefile
 new file mode 100644
+index 000000000000..681b0eebd4ea
 --- /dev/null
 +++ b/drivers/net/wireless/rdaw80211/rdacombodev/Makefile
 @@ -0,0 +1,10 @@
@@ -81,6 +113,7 @@ new file mode 100644
 +	rda_5991g_power_ctrl.o
 diff --git a/drivers/net/wireless/rdaw80211/rdacombodev/rda_5990_power_ctrl.c b/drivers/net/wireless/rdaw80211/rdacombodev/rda_5990_power_ctrl.c
 new file mode 100644
+index 000000000000..05a0397e8993
 --- /dev/null
 +++ b/drivers/net/wireless/rdaw80211/rdacombodev/rda_5990_power_ctrl.c
 @@ -0,0 +1,1365 @@
@@ -1451,6 +1484,7 @@ new file mode 100644
 +
 diff --git a/drivers/net/wireless/rdaw80211/rdacombodev/rda_5991_power_ctrl.c b/drivers/net/wireless/rdaw80211/rdacombodev/rda_5991_power_ctrl.c
 new file mode 100644
+index 000000000000..0da51d08f8de
 --- /dev/null
 +++ b/drivers/net/wireless/rdaw80211/rdacombodev/rda_5991_power_ctrl.c
 @@ -0,0 +1,773 @@
@@ -2229,6 +2263,7 @@ new file mode 100644
 +}
 diff --git a/drivers/net/wireless/rdaw80211/rdacombodev/rda_5991e_power_ctrl.c b/drivers/net/wireless/rdaw80211/rdacombodev/rda_5991e_power_ctrl.c
 new file mode 100644
+index 000000000000..e528388e9e73
 --- /dev/null
 +++ b/drivers/net/wireless/rdaw80211/rdacombodev/rda_5991e_power_ctrl.c
 @@ -0,0 +1,847 @@
@@ -3081,6 +3116,7 @@ new file mode 100644
 +
 diff --git a/drivers/net/wireless/rdaw80211/rdacombodev/rda_5991f_power_ctrl.c b/drivers/net/wireless/rdaw80211/rdacombodev/rda_5991f_power_ctrl.c
 new file mode 100644
+index 000000000000..3f7be4c3e421
 --- /dev/null
 +++ b/drivers/net/wireless/rdaw80211/rdacombodev/rda_5991f_power_ctrl.c
 @@ -0,0 +1,811 @@
@@ -3897,6 +3933,7 @@ new file mode 100644
 +
 diff --git a/drivers/net/wireless/rdaw80211/rdacombodev/rda_5991g_power_ctrl.c b/drivers/net/wireless/rdaw80211/rdacombodev/rda_5991g_power_ctrl.c
 new file mode 100644
+index 000000000000..26c8eda29e99
 --- /dev/null
 +++ b/drivers/net/wireless/rdaw80211/rdacombodev/rda_5991g_power_ctrl.c
 @@ -0,0 +1,891 @@
@@ -4793,6 +4830,7 @@ new file mode 100644
 +
 diff --git a/drivers/net/wireless/rdaw80211/rdacombodev/rda_combo.h b/drivers/net/wireless/rdaw80211/rdacombodev/rda_combo.h
 new file mode 100644
+index 000000000000..76f1e4223bcf
 --- /dev/null
 +++ b/drivers/net/wireless/rdaw80211/rdacombodev/rda_combo.h
 @@ -0,0 +1,205 @@
@@ -5003,9 +5041,10 @@ new file mode 100644
 +
 diff --git a/drivers/net/wireless/rdaw80211/rdacombodev/rda_combo_power_main.c b/drivers/net/wireless/rdaw80211/rdacombodev/rda_combo_power_main.c
 new file mode 100644
+index 000000000000..95b4a2ddab78
 --- /dev/null
 +++ b/drivers/net/wireless/rdaw80211/rdacombodev/rda_combo_power_main.c
-@@ -0,0 +1,374 @@
+@@ -0,0 +1,403 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * RDA599x WiFi/BT combo chip power controller — modern forward-port.
@@ -5347,6 +5386,34 @@ new file mode 100644
 +	return 0;
 +}
 +
++/*
++ * Bench aid: force the wifi power state from userspace
++ * (echo 0/1 > /sys/bus/i2c/devices/0-00xx/wifi_power). The vendor flow
++ * always powers the chip OFF (rfkill blocked at init) before the ON that
++ * precedes SDIO enumeration; this lets the bench replicate that
++ * transition without a driver rebind.
++ */
++static ssize_t wifi_power_store(struct device *dev,
++				struct device_attribute *attr,
++				const char *buf, size_t count)
++{
++	bool on;
++	int ret;
++
++	if (kstrtobool(buf, &on))
++		return -EINVAL;
++
++	ret = on ? rda_wifi_power_on() : rda_wifi_power_off();
++	return ret ? -EIO : count;
++}
++static DEVICE_ATTR_WO(wifi_power);
++
++static struct attribute *rda_combo_attrs[] = {
++	&dev_attr_wifi_power.attr,
++	NULL
++};
++ATTRIBUTE_GROUPS(rda_combo);
++
 +static const struct of_device_id rda_combo_dt_ids[] = {
 +	{ .compatible = "rda,wifi-core-i2c", .data = "wifi-core" },
 +	{ .compatible = "rda,wifi-rf-i2c", .data = "wifi-rf" },
@@ -5361,6 +5428,7 @@ new file mode 100644
 +	.driver = {
 +		.name = "rda_combo",
 +		.of_match_table = rda_combo_dt_ids,
++		.dev_groups = rda_combo_groups,
 +	},
 +};
 +
@@ -5380,3 +5448,6 @@ new file mode 100644
 +
 +MODULE_DESCRIPTION("RDA599x WiFi/BT combo power controller");
 +MODULE_LICENSE("GPL");
+-- 
+2.55.0
+

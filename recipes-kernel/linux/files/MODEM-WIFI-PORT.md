@@ -672,3 +672,80 @@ init at 0.87 s. Fixed by masking every head/tail read AND gating the probe
 handshake on `mdsys_rings_sane()` (all four pointers in-range and aligned;
 the bootloader zeroes them when it inits mdcom). Never trust dpram contents
 that only a modem-aware bootloader initializes.
+
+---
+
+## 14. Stage 3 with the msys client live: what is now ELIMINATED (2026-07-24)
+
+The msys transport works. On the vendor card the driver prints
+`rda-mdsys 200000.mailbox: modem running, interface version 0x00010001`,
+every command returns BP status 0, and the combo power-on runs with no
+`enable failed` warnings. **`mmc1` still fails.** A full bench day of
+bisection eliminated, each by direct measurement on hardware:
+
+| Suspect | How it was eliminated |
+|---------|----------------------|
+| msys transport / handshake | BP_INFO succeeds; all commands return status 0 |
+| v_bt (pm 10), v_sdmmc (pm 7) | sent and ACKed, alone and together |
+| **all EN-type rails** (pm 1/7/8/10/11/12/13, incl. **v_fm**, same die) | all seven ACKed in one batch, then power-cycle + detect: no change |
+| `SYS_PM_CMD_SET_LEVEL` for v_bt | not applicable: `bt_config.msys_cmd = SYS_PM_CMD_EN`; `set_voltage_sel()` returns `-EINVAL` for EN-type rails |
+| AUX_CLK payload shape | vendor `struct low_freq_clk_param { u32 enable; }` — exactly what we send |
+| md_sysctrl clock gates | `Cfg_Clk_Auxclk`=1 and `Cfg_Clk_Out`=0x200 forced by hand (incl. the `REG_DBG` 0xA50001 unlock); no change |
+| APB2 SDMMC2 clock gate | `0x209000A8` already `0x001FFFFF` (bit 17 set) on both boot paths |
+| APB2 SDMMC2 reset | manual pulse verified by readback (`0xFFF`→`0xDFF`); our `reset_control` writes are register-exact vs vendor (`0x4C`/`0x50`, `BIT(9)`, 1 ms) |
+| pad mux | `BB_GPIO_Mode = 0x7FE001FF` (bits 9–20 alt-func = both SD interfaces) |
+| clock divider | our dyndbg `divider = 99` == vendor log `divider = 99` at 1 MHz |
+| probe/rescan ordering | manual unbind/bind after power-on, dozens of times |
+| **OFF → ON transition** | the vendor always powers off first (rfkill blocked at init). Replicated via a new `wifi_power` sysfs hook: `power_off succeed!!` then the full 9-step on. No change |
+| response classification | dyndbg shows correct `cfg` per command (`0x31` R3-select for CMD5) and `NO_RSP` set immediately, resp regs zeroed |
+
+Command-level truth from dyndbg on our kernel: CMD52/CMD8/CMD5/CMD55/CMD1 all
+return `-110` with zeroed response registers — i.e. the chip is electrically
+silent, not answering-and-being-rejected. The vendor's successful path shows
+`mmc1: card claims to support voltages below the defined range` (a real CMD5
+OCR reply) — we never get that far.
+
+### Two operational traps found today (cost hours)
+
+1. **The vendor u-boot's default `bootargs` name no console.** A kernel booted
+   from it without `setenv bootargs "earlycon console=ttyRDA2,921600"` runs
+   completely silently and looks identical to a hang at `Starting kernel ...`.
+2. **The modem powers itself off ~10–20 min after a keyless boot.** u-boot says
+   so up front: `Power-on key is not pressed for normal boot / Shutdown is
+   needed later`. Once it goes, every msys command times out (`cmd ... timed
+   out`, `-110`) — silently invalidating any experiment run late in a session.
+   Check `devmem 0x20980018` (COMREG IT_CLR): bit 5 (`0x20`) set = BP shut
+   down; and re-verify with a `pm` command before trusting any late result.
+   **Do the decisive experiment in the first minutes after boot.**
+
+### What is left
+
+Everything software-visible now matches the vendor. The remaining difference
+must be in state we have not looked at:
+
+1. **Register diff against the working system.** Dump `0x11a09000..0x11a0907c`
+   (pads), `0x11a00000..0x11a000fc` (md_sysctrl) and the SDMMC2 file at
+   **`0x20a60800..0x20a608fc`** (note: `+0x800`, not the APBI wrapper at
+   `+0x000` — `TRANS_SPEED` lives at `0x20a6083c`) on the vendor system while
+   `wlan0` is up, and diff against ours. Caveat: `dd if=/dev/mem` returns
+   `EFAULT` on the vendor 3.10 kernel — use a python `mmap` reader instead.
+2. **Modem firmware disassembly.** `~/Desktop/modem-cross-compiler-linux.tar.gz`
+   has a `mips-elf-` toolchain (the xcpu is MIPS per the mkimage headers).
+   The msys magic `0xA8B1` appears at exactly 3 offsets in the extracted
+   `Modem work codes` payload (`0x07c64e`, `0x07ec9a`, `0x0e7488`) — good
+   anchors for finding the command dispatch and reading what the
+   `SYS_PM_CMD_EN` / `AUX_CLK` handlers actually write to the PMU over ISPI.
+3. **Power-key boot variant.** Hold the power button during `mdcom_check` so
+   the modem does not schedule its shutdown, and see whether rail behaviour
+   differs.
+
+### Bench aids added for this work
+
+- `wifi_power` sysfs attribute on every combo I2C client
+  (`echo 0|1 > /sys/bus/i2c/devices/0-0016/wifi_power`) — forces
+  `rda_wifi_power_off()` / `rda_wifi_power_on()` without a driver rebind.
+- `CONFIG_DYNAMIC_DEBUG=y` in `rda8810pl.cfg`; enable the MMC trace with
+  `echo 'file drivers/mmc/host/rda-mmc.c +p' > /sys/kernel/debug/dynamic_debug/control`
+  (also `drivers/mmc/core/core.c` for the core's per-command lines).
+- `/home/orangepi/dump-regs.sh` on the vendor rootfs (needs the python-mmap
+  rewrite, see above).
