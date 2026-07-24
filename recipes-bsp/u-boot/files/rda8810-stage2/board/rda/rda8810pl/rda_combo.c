@@ -412,8 +412,13 @@ static void rda_combo_pinmux(bool verbose)
 
 /*
  * Enable the 32 kHz and 26 MHz low-frequency outputs the vendor combo driver
- * asks the modem for. Not required for the chip to answer I2C; done here so the
- * RF blocks have their reference for stage 3/4.
+ * asks the modem for. Not required for the chip to answer I2C.
+ *
+ * NOT called from the latch any more (2026-07-24). A vendor system with wlan0
+ * up has both of these registers reading 0, and the bench run where SDIO first
+ * enumerated had them at 0 too -- so setting them is a deviation from the
+ * known-good state, not a step towards it. Kept behind "rdacombo clocks" so
+ * the stage-3/4 RF work can still try them deliberately.
  */
 static void rda_combo_clocks(bool verbose)
 {
@@ -442,7 +447,6 @@ static void rda_combo_clocks(bool verbose)
 void rda_combo_power_latch(bool verbose)
 {
 	rda_combo_pinmux(verbose);
-	rda_combo_clocks(verbose);
 
 	/* The vendor's regulator bring-up settles well before its first I2C
 	 * transfer; 2 ms is generous for an LDO ramp. */
@@ -644,6 +648,11 @@ static int do_rdacombo(struct cmd_tbl *cmdtp, int flag, int argc,
 		return CMD_RET_SUCCESS;
 	}
 
+	if (!strcmp(argv[1], "clocks")) {
+		rda_combo_clocks(true);
+		return CMD_RET_SUCCESS;
+	}
+
 	if (!strcmp(argv[1], "scan")) {
 		u32 first = (argc > 2) ? hextoul(argv[2], NULL) : 0x00;
 		u32 last = (argc > 3) ? hextoul(argv[3], NULL) :
@@ -661,7 +670,9 @@ static int do_rdacombo(struct cmd_tbl *cmdtp, int flag, int argc,
 U_BOOT_CMD(rdacombo, 4, 0, do_rdacombo,
 	   "RDA599x WiFi/BT combo bring-up (see MODEM-WIFI-PORT.md)",
 	   "id                    - read project_id/chip_version over I2C\n"
-	   "rdacombo on                    - mux I2C1 to its pads + enable 32k/26M, then read the id\n"
+	   "rdacombo on                    - apply the vendor pad map, then read the id\n"
+	   "rdacombo clocks                - enable the 32k/26M md_sysctrl outputs (NOT in the\n"
+	   "                                 boot latch: a working vendor system has them at 0)\n"
 	   "rdacombo scan [first [last]]   - hunt a PMU enable bit (default 0x00..0x3f)\n"
 	   "\n"
 	   "A working RDA5991_G answers project_id 0x5991, chip_version 0x47.\n"
