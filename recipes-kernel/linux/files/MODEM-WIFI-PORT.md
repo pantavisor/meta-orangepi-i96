@@ -1,13 +1,15 @@
 # Orange Pi i96 (RDA8810PL) — Modem / WiFi bring-up port plan
 
-Status: **stage 2 solved (pinmux); stage 3: msys client implemented (§13), awaiting bench.**
+Status: **stages 2 and 3 DONE — both were pinmux. No modem needed. See §15.**
 
-- **Stage 2 (I2C control) — DONE.** Not a modem problem: two pinmux bits. See §10.
-- **Stage 3 (SDIO data) — BLOCKED, cause identified §11.** The vendor u-boot loads
-  a 2 MB `modem.bin` and starts the modem coprocessor *before* booting Linux. We
-  never have. The RDA5991's I2C slave runs without it, but its digital core needs
-  the modem-gated 26 MHz, so SDIO never answers. §1 was right about the modem —
-  it was only wrong about which interface the modem gates.
+- **Stage 2 (I2C control) — DONE.** Two pinmux bits. See §10.
+- **Stage 3 (SDIO data) — DONE (2026-07-24).** Also pinmux: the *five* pad
+  registers in §15, not the two we had. On our own u-boot, with no modem
+  anywhere, `mmc1: new SDIO card at address 4829` — the same address the
+  vendor Debian reports. **The modem is NOT required for WiFi**, so
+  `mdcom_loadm` never needs porting and `modem.bin`'s proprietary licensing
+  is a non-issue. §11's "the modem gates the 26 MHz" conclusion was wrong.
+- **Stage 4 (`rdawlan` cfg80211 port) — next.** Nothing else blocks it.
 
 Original (now partly superseded) status: **SOLVED — and it was not the modem.** The RDA5991_G answers I2C from
 u-boot with `project_id 0x5991, chip_version 0x47`, matching the vendor image
@@ -749,3 +751,78 @@ must be in state we have not looked at:
   (also `drivers/mmc/core/core.c` for the core's per-command lines).
 - `/home/orangepi/dump-regs.sh` on the vendor rootfs (needs the python-mmap
   rewrite, see above).
+
+---
+
+## 15. STAGE 3 SOLVED: five pad registers, no modem (2026-07-24)
+
+`mmc1: new SDIO card at address 4829` on our own u-boot, our own image, with
+`rda-mdsys` reporting `modem not running`. The card enumerates at boot, ~2.4 s,
+with no manual intervention.
+
+### The fix
+
+Five whole-register writes, applied in u-boot `rda_combo_pinmux()`
+(`recipes-bsp/u-boot/files/rda8810-stage2/board/rda/rda8810pl/rda_combo.c`):
+
+| register | value | note |
+|----------|-------|------|
+| `0x11a09008` BB_GPIO_Mode | `0x7fe0003f` | bits 6..8 matter too, not just the SDMMC2 pads 15..20 |
+| `0x11a0900c` AP_GPIO_A_Mode | `0x000210fc` | reset value is `0xffffffff` (all GPIO) |
+| `0x11a09010` AP_GPIO_B_Mode | `0x3f00033f` | we previously only cleared the two I2C1 bits |
+| `0x11a09018` pad cfg | `0x14040040` | we never wrote it at all (read `0`) |
+| `0x11a0901c` pad cfg | `0x006e4524` | differs from reset in bits 16..23 |
+
+Values read from a running vendor system with `wlan0` up. Per-pad meaning is
+undocumented; the vendor kernel programs them from its own board files. All
+five are required — the bisection showed each one breaking enumeration in a
+different way, e.g. AP_GPIO_B back to `0x3fffffff` kills CMD5 outright while
+AP_GPIO_A back to `0xffffffff` leaves CMD5 answering but fails init at `-110`.
+
+### How it was found, after everything else was eliminated
+
+§14 lists a full day of eliminations (all msys rails, both md_sysctrl clock
+gates, the APB2 gate and reset, clock divider, probe ordering, the vendor's
+OFF→ON power transition, response classification) — every software-visible
+knob measured equal to the vendor's while CMD5 stayed electrically silent.
+What finally worked was **dumping registers from the running vendor system and
+diffing them against ours**. Two rounds of that:
+
+1. pads `0x11a09000..0x11a0907c` → the five differences above;
+2. AP sysctrl `0x20900000..0x209000fc` → **byte-for-byte identical**, which
+   ruled out the entire clock/reset domain and left the pads as the answer.
+
+### The modem question, settled
+
+Three controlled boots, all with our 6.6 kernel:
+
+| u-boot | pad map | modem | SDIO |
+|--------|---------|-------|------|
+| vendor | applied by hand | **running** | works |
+| vendor | applied by hand | **absent** (skipped `mdcom_loadm`) | **works** |
+| ours   | applied by u-boot | absent | works |
+
+The middle row is the one that matters: same vendor bootloader, modem
+deliberately not loaded, still enumerates. So the modem was never the gating
+factor for WiFi — §1/§11 were wrong, and the msys client (§13, patches 22–25)
+is not needed for stage 3. It stays in tree because it is correct, tested, and
+will be wanted for BT/FM/PM later; on a modemless boot it disables itself.
+
+### Method notes worth keeping
+
+- **Register-diff against a working system beats reasoning.** Two rounds of it
+  solved what a day of hypothesis-testing could not. When a peripheral is
+  "electrically silent" and every software knob matches, dump both sides.
+- **Every earlier negative was real but incomplete.** The msys work, the clock
+  gates, the OFF→ON transition — all correctly eliminated, none of them the
+  cause. The eliminations are what made the register diff the obvious move.
+- **Partial fixes hide the answer.** Stage 2 needed two bits of AP_GPIO_B;
+  getting those right made I2C work and made it tempting to believe the pad
+  story was finished. It was not — three more registers were still wrong.
+
+### Remaining loose end
+
+The kernel has no RDA pinctrl driver, so this lives in the bootloader and
+depends on it. A DT-driven pinctrl driver is the correct home and is the
+natural upstream story; until then, anyone booting a different bootloader must
+replicate these five writes.

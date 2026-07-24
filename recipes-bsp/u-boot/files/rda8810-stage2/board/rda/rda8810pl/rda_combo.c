@@ -184,8 +184,13 @@ static bool rda_pmu_reg_denied(u32 reg)
  * its own board files. Do not "simplify" them into single-bit clears without
  * re-running the bisection.
  */
+#define CFG_REGS_PAD_CFG0	0x18
+#define CFG_REGS_PAD_CFG1	0x1c
+#define BB_GPIO_MODE_VENDOR	0x7fe0003f
 #define AP_GPIO_A_MODE_VENDOR	0x000210fc
 #define AP_GPIO_B_MODE_VENDOR	0x3f00033f
+#define PAD_CFG0_VENDOR		0x14040040
+#define PAD_CFG1_VENDOR		0x006e4524
 
 /*
  * The combo chip's SDIO data path (SDMMC2 @ 0x20a60000, "mmc@60000") has the
@@ -353,23 +358,6 @@ static void rda_combo_report_id(void)
 
 /* ------------------------------------------------------------- the latch --- */
 
-/* Clear one pad-mux register's bits (0 = alternate function, 1 = GPIO). */
-static void rda_pinmux_to_alt(u32 off, u32 pads, const char *name, bool verbose)
-{
-	void __iomem *reg = (void __iomem *)(RDA_CFG_REGS_BASE + off);
-	u32 before = readl(reg);
-	u32 want = before & ~pads;
-	u32 got;
-
-	writel(want, reg);
-	got = readl(reg);
-
-	if (verbose || got != want)
-		printf("rdacombo: %s 0x%08x -> 0x%08x readback 0x%08x%s\n",
-		       name, before, want, got,
-		       got == want ? "" : "  *** WRITE REJECTED ***");
-}
-
 /* Write a pad-mux register outright (used for the vendor's whole-register map). */
 static void rda_pinmux_set(u32 off, u32 want, const char *name, bool verbose)
 {
@@ -389,25 +377,30 @@ static void rda_pinmux_set(u32 off, u32 want, const char *name, bool verbose)
 /* Mux the combo chip's two buses away from the GPIO block. This is the fix. */
 static void rda_combo_pinmux(bool verbose)
 {
-	/* I2C1 SCL/SDA -- control interface. Confirmed on hardware. */
-	rda_pinmux_to_alt(CFG_REGS_AP_GPIO_B_MODE,
-			  AP_GPIO_B_I2C1_SCL | AP_GPIO_B_I2C1_SDA,
-			  "AP_GPIO_B_Mode (I2C1 SCL/SDA)", verbose);
-
-	/* SDMMC2 CLK/CMD/D0-3 -- SDIO data path for stage 3. */
-	rda_pinmux_to_alt(CFG_REGS_BB_GPIO_MODE, BB_GPIO_SDMMC2_PADS,
-			  "BB_GPIO_Mode (SDMMC2)", verbose);
-
 	/*
-	 * The rest of the vendor pad map. Required for the combo chip's SDIO
-	 * block to answer at all -- see the comment on AP_GPIO_A_MODE_VENDOR.
-	 * Written whole rather than masked: these registers come out of reset
-	 * all-GPIO and the vendor value is the known-good target.
+	 * The complete vendor pad map. All five registers are required: with
+	 * any one of them left at its reset/partial value the RDA5991's SDIO
+	 * block never answers CMD5. Proven on hardware 2026-07-24 by writing
+	 * exactly these five on our own (modemless) boot path:
+	 *
+	 *	mmc1: new SDIO card at address 4829
+	 *
+	 * the same address the vendor Debian reports. See section 15 of
+	 * recipes-kernel/linux/files/MODEM-WIFI-PORT.md for the bisection.
+	 *
+	 * Note BB_GPIO_Mode: clearing only the SDMMC2 pads (bits 15..20) is
+	 * not enough, bits 6..8 must go to alternate function as well.
 	 */
+	rda_pinmux_set(CFG_REGS_BB_GPIO_MODE, BB_GPIO_MODE_VENDOR,
+		       "BB_GPIO_Mode", verbose);
 	rda_pinmux_set(CFG_REGS_AP_GPIO_A_MODE, AP_GPIO_A_MODE_VENDOR,
-		       "AP_GPIO_A_Mode (vendor map)", verbose);
+		       "AP_GPIO_A_Mode", verbose);
 	rda_pinmux_set(CFG_REGS_AP_GPIO_B_MODE, AP_GPIO_B_MODE_VENDOR,
-		       "AP_GPIO_B_Mode (vendor map)", verbose);
+		       "AP_GPIO_B_Mode", verbose);
+	rda_pinmux_set(CFG_REGS_PAD_CFG0, PAD_CFG0_VENDOR,
+		       "pad cfg 0x18", verbose);
+	rda_pinmux_set(CFG_REGS_PAD_CFG1, PAD_CFG1_VENDOR,
+		       "pad cfg 0x1c", verbose);
 }
 
 /*
