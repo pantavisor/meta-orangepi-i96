@@ -1,0 +1,199 @@
+From 0611b6c268c8a3fc2dbd6f00d72cdc3a3ab8751f Mon Sep 17 00:00:00 2001
+From: Sergio Marin <sergio.marin@pantacor.com>
+Date: Tue, 28 Jul 2026 15:52:08 -0400
+Subject: [PATCH] power: reset: add restart and power-off for RDA8810PL
+
+reboot(2) does not reboot this SoC -- it halts the CPU and the board then
+needs a physical power cycle. There is no restart handler because there is
+nothing mainline can call: the vendor resets the RDA8810PL from the modem
+coprocessor. Its rda_wdt.c is an AP->modem heartbeat ("System reset is done
+by Modem"), .restart is commented out in board-rda8810.c, and mach/system.h
+arch_reset() is an empty stub. Mainline never starts the modem.
+
+It does not need to. The whole-chip soft reset is a bit in the always-on MD
+system controller, which the AP can reach directly with the modem stopped --
+the same block and the same write-protect register already used for the
+combo chip's low-frequency clocks:
+
+  REG_DBG      (0x00) = 0x00a50001   unlock
+  Sys_Rst_Set  (0x04) = BIT(31)      SYS_CTRL_SOFT_RST
+
+Power-off is the pair the vendor bootloader's shutdown_system() issues, from
+the same block: the same unlock, then clearing FORCE_WAKEUP in WakeUp (0x80),
+spun in a loop as the vendor does.
+
+Register names and bit positions are from the vendor u-boot header
+arch/arm/include/asm/arch-rda/reg_md_sysctrl_rda8810.h.
+
+The node is enabled in the SoC dtsi rather than per board: every RDA8810PL
+resets the same way, there is nothing board-specific to describe, and both
+in-tree boards want it.
+
+Note this also makes panic= effective. The pantavisor cmdline carries
+panic=3, which until now silently did nothing.
+
+Upstream-Status: Pending
+---
+ arch/arm/boot/dts/unisoc/rda8810pl.dtsi | 11 +++
+ drivers/power/reset/Kconfig             | 10 +++
+ drivers/power/reset/Makefile            |  1 +
+ drivers/power/reset/rda8810pl-restart.c | 95 +++++++++++++++++++++++++
+ 4 files changed, 117 insertions(+)
+ create mode 100644 drivers/power/reset/rda8810pl-restart.c
+
+diff --git a/arch/arm/boot/dts/unisoc/rda8810pl.dtsi b/arch/arm/boot/dts/unisoc/rda8810pl.dtsi
+index 9e788da..0886360 100644
+--- a/arch/arm/boot/dts/unisoc/rda8810pl.dtsi
++++ b/arch/arm/boot/dts/unisoc/rda8810pl.dtsi
+@@ -55,6 +55,17 @@
+ 		#size-cells = <1>;
+ 		ranges = <0x0 0x10000000 0xfffffff>;
+ 
++		/*
++		 * Always-on MD system controller. Reachable from the AP
++		 * with the modem stopped, which is what makes a
++		 * modem-independent restart possible at all -- the vendor
++		 * resets this SoC from the modem coprocessor.
++		 */
++		sysctrl_md: system-controller@1a00000 {
++			compatible = "rda,8810pl-restart";
++			reg = <0x1a00000 0x1000>;
++		};
++
+ 		gpioc: gpioc@1a08000 {
+ 			compatible = "rda,8810pl-gpio";
+ 			reg = <0x1a08000 0x1000>;
+diff --git a/drivers/power/reset/Kconfig b/drivers/power/reset/Kconfig
+index 411e00b..07430d1 100644
+--- a/drivers/power/reset/Kconfig
++++ b/drivers/power/reset/Kconfig
+@@ -192,6 +192,16 @@ config POWER_RESET_REGULATOR
+ 	  This driver supports turning off your board by disabling a
+ 	  power regulator defined in the devicetree.
+ 
++config POWER_RESET_RDA8810PL
++	bool "RDA Micro RDA8810PL restart and power-off driver"
++	depends on ARCH_RDA || COMPILE_TEST
++	default ARCH_RDA
++	help
++	  Restart and power-off support for the RDA Micro RDA8810PL, driven
++	  through the always-on MD system controller. The vendor resets this
++	  SoC from the modem coprocessor, which mainline does not start, so
++	  without this driver reboot(2) only halts the CPU.
++
+ config POWER_RESET_RESTART
+ 	bool "Restart power-off driver"
+ 	help
+diff --git a/drivers/power/reset/Makefile b/drivers/power/reset/Makefile
+index a95d1bd..e298ee5 100644
+--- a/drivers/power/reset/Makefile
++++ b/drivers/power/reset/Makefile
+@@ -21,6 +21,7 @@ obj-$(CONFIG_POWER_RESET_PIIX4_POWEROFF) += piix4-poweroff.o
+ obj-$(CONFIG_POWER_RESET_LTC2952) += ltc2952-poweroff.o
+ obj-$(CONFIG_POWER_RESET_QNAP) += qnap-poweroff.o
+ obj-$(CONFIG_POWER_RESET_REGULATOR) += regulator-poweroff.o
++obj-$(CONFIG_POWER_RESET_RDA8810PL) += rda8810pl-restart.o
+ obj-$(CONFIG_POWER_RESET_RESTART) += restart-poweroff.o
+ obj-$(CONFIG_POWER_RESET_ST) += st-poweroff.o
+ obj-$(CONFIG_POWER_RESET_TPS65086) += tps65086-restart.o
+diff --git a/drivers/power/reset/rda8810pl-restart.c b/drivers/power/reset/rda8810pl-restart.c
+new file mode 100644
+index 0000000..440076f
+--- /dev/null
++++ b/drivers/power/reset/rda8810pl-restart.c
+@@ -0,0 +1,95 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Restart and power-off for RDA Micro RDA8810PL.
++ *
++ * Both live in the always-on MD system controller and are reachable from the
++ * AP with no modem coprocessor running. That matters here: the vendor's own
++ * reset path goes through the modem -- its rda_wdt.c is an AP->modem
++ * heartbeat, "System reset is done by Modem" -- and mainline never starts the
++ * modem, so without this the machine has no restart handler at all and
++ * reboot(2) just halts the CPU.
++ */
++
++#include <linux/bits.h>
++#include <linux/delay.h>
++#include <linux/io.h>
++#include <linux/mod_devicetable.h>
++#include <linux/platform_device.h>
++#include <linux/reboot.h>
++
++/* Offsets into the MD system controller. */
++#define RDA_SYSCTRL_REG_DBG		0x00
++#define RDA_SYSCTRL_SYS_RST_SET		0x04
++#define RDA_SYSCTRL_WAKEUP		0x80
++
++/* REG_DBG gates writes to every protected register in the block. */
++#define RDA_SYSCTRL_PROTECT_UNLOCK	0x00a50001
++
++#define RDA_SYSCTRL_SOFT_RST		BIT(31)
++
++static int rda8810pl_restart(struct sys_off_data *data)
++{
++	void __iomem *base = data->cb_data;
++
++	writel(RDA_SYSCTRL_PROTECT_UNLOCK, base + RDA_SYSCTRL_REG_DBG);
++	writel(RDA_SYSCTRL_SOFT_RST, base + RDA_SYSCTRL_SYS_RST_SET);
++
++	mdelay(100);
++
++	return NOTIFY_DONE;
++}
++
++static int rda8810pl_power_off(struct sys_off_data *data)
++{
++	void __iomem *base = data->cb_data;
++
++	/*
++	 * Clearing FORCE_WAKEUP drops the always-on domain. The vendor
++	 * bootloader spins on the unlock/clear pair rather than issuing it
++	 * once, so do the same.
++	 */
++	while (1) {
++		writel(RDA_SYSCTRL_PROTECT_UNLOCK, base + RDA_SYSCTRL_REG_DBG);
++		writel(0, base + RDA_SYSCTRL_WAKEUP);
++	}
++
++	return NOTIFY_DONE;
++}
++
++static int rda8810pl_restart_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	void __iomem *base;
++	int ret;
++
++	base = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(base))
++		return PTR_ERR(base);
++
++	ret = devm_register_restart_handler(dev, rda8810pl_restart, base);
++	if (ret)
++		return dev_err_probe(dev, ret,
++				     "cannot register restart handler\n");
++
++	ret = devm_register_power_off_handler(dev, rda8810pl_power_off, base);
++	if (ret)
++		return dev_err_probe(dev, ret,
++				     "cannot register power-off handler\n");
++
++	return 0;
++}
++
++static const struct of_device_id rda8810pl_restart_of_match[] = {
++	{ .compatible = "rda,8810pl-restart" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, rda8810pl_restart_of_match);
++
++static struct platform_driver rda8810pl_restart_driver = {
++	.probe = rda8810pl_restart_probe,
++	.driver = {
++		.name = "rda8810pl-restart",
++		.of_match_table = rda8810pl_restart_of_match,
++	},
++};
++builtin_platform_driver(rda8810pl_restart_driver);

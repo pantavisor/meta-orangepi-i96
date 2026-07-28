@@ -69,3 +69,12 @@ SRC_URI:append:orangepi-i96 = " \
     file://rda-mmc-30-wifi-rdawlan-debug-module-params.patch \
     file://rda-mmc-31-wifi-rdawlan-claim-sdio-irq-when-leaving-poll.patch \
 "
+
+# Machine restart and power-off. Unrelated to WiFi, but the WiFi bring-up is
+# what made its absence expensive: reboot(2) only halted the CPU, so every
+# iteration needed a physical power cycle. The vendor resets this SoC from the
+# modem coprocessor, which mainline never starts; the soft-reset bit in the
+# always-on MD system controller does it without one.
+SRC_URI:append:orangepi-i96 = " \
+    file://rda-mmc-32-power-reset-add-rda8810pl-restart.patch \
+"

@@ -1177,8 +1177,9 @@ no rebuild:
 - `stty -F /dev/ttyUSB1 921600 raw -echo`, then `cat` to capture and
   `printf ... > /dev/ttyUSB1` to type. picocom is not needed and holding the
   port with picocom would block this.
-- `reboot -f` **halts the board**; mainline 6.6 has no RDA restart handler,
-  so it needs a physical power cycle afterwards. Do not use it.
+- `reboot -f` **halted the board** on every build up to patch 31; mainline
+  6.6 had no RDA restart handler, so it needed a physical power cycle
+  afterwards. Fixed by patch 32 — see §19.
 - To change the cmdline for one boot: interrupt autoboot (spam a bare space
   during power-on), then replay `boot.scr` by hand with the param appended.
   There is no saved environment (`/uboot.env` is absent, the built-in default
@@ -1218,3 +1219,71 @@ two git commits and asking *what did we change in this path*, rather than
 *what is wrong with this path*. §16 records the same lesson from the other
 direction: each stage that unblocks a path exposes the first real bug in the
 layer below. Here the layer below was us.
+
+---
+
+## 19. Machine restart and power-off (2026-07-28, patch 32)
+
+Not a WiFi problem, but the WiFi bring-up is what made it expensive: every
+`reboot` halted the board and cost a walk to the bench. There was no restart
+handler because there was nothing to call — and the reason is the same modem
+story that dominated stages 1–3.
+
+The vendor resets this SoC **from the modem coprocessor**:
+
+- `drivers/watchdog/rda_wdt.c` is not a watchdog at all. It is an AP→modem
+  heartbeat — the AP bumps `ap_cnt` in shared memory and the modem resets the
+  system if it stops. Its own header says so: *"Based on rda md driver - md
+  heartbeat. System reset is done by Modem"*.
+- `arch/arm/mach-rda/board-rda8810.c` has `//.restart = rda8810_restart,` —
+  commented out.
+- `arch/arm/mach-rda/include/mach/system.h` `arch_reset()` is an empty stub.
+
+So the vendor kernel has no AP-side reset either. Mainline never starts the
+modem, so `reboot(2)` fell through to halting the CPU.
+
+### It does not need the modem
+
+The whole-chip soft reset is a bit in the **always-on MD system controller**
+at `0x11A00000` — the same block, behind the same write-protect register, as
+the `Cfg_Clk_Out`/`Cfg_Clk_Auxclk` gates §14 was already poking from the AP
+with the modem stopped:
+
+| Offset | Register | Use |
+|--------|----------|-----|
+| `0x00` | `REG_DBG` | unlock, `0x00a50001` |
+| `0x04` | `Sys_Rst_Set` | `BIT(31)` = `SYS_CTRL_SOFT_RST` (whole chip) |
+| `0x80` | `WakeUp` | clear `FORCE_WAKEUP` = power off |
+
+Restart is unlock + `BIT(31)`. Power-off is the pair the vendor bootloader's
+`shutdown_system()` issues — unlock + `WakeUp = 0`, spun in a loop as the
+vendor does. Names and bit positions come from the vendor u-boot header
+`arch/arm/include/asm/arch-rda/reg_md_sysctrl_rda8810.h`.
+
+Note `Sys_Rst_Set` also has `BIT(30)` = `SYS_CTRL_SET_RST_OUT`, which drives
+the external reset output. If `BIT(31)` alone turns out not to reset the
+board, that is the next thing to try — it is a one-constant change.
+
+### What patch 32 adds
+
+`drivers/power/reset/rda8810pl-restart.c`, a ~90-line platform driver using
+the 6.6 sys-off API (`devm_register_restart_handler` /
+`devm_register_power_off_handler`), plus `CONFIG_POWER_RESET_RDA8810PL`, and
+a `system-controller@1a00000` node in the SoC dtsi. The node is in the dtsi
+rather than per board: every RDA8810PL resets the same way and both in-tree
+boards want it.
+
+u-boot's `reset_cpu()` in `arch/arm/mach-rda/soc.c` was the same stub
+(`while (1) ;`) and now does the same two writes, so `reset` works at the
+u-boot prompt too.
+
+**Side effect worth knowing:** this makes `panic=` effective. The pantavisor
+cmdline carries `panic=3`, which until now silently did nothing — the board
+will now reboot on a panic instead of sitting there.
+
+### Untested
+
+Written from the vendor headers, not yet run. Verify with `reboot` (should
+come back through u-boot) and `poweroff`. Do not confuse this soft reset with
+the APBI `SOFT_RST_L` pulse in the MMC wrapper, which is a different register
+and must not be touched — see the MMC bring-up notes.

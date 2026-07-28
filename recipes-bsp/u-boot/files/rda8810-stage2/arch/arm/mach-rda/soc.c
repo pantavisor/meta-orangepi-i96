@@ -8,6 +8,7 @@
 #include <cpu_func.h>
 #include <debug_uart.h>
 #include <stdio.h>
+#include <asm/io.h>
 
 int arch_cpu_init(void)
 {
@@ -32,9 +33,26 @@ int print_cpuinfo(void)
 	return 0;
 }
 
-/* TODO(hw): reset via the RDA watchdog/reset register; stub for now. */
+/*
+ * Whole-chip soft reset, from the always-on MD system controller. The AP can
+ * reach it with the modem stopped, which is the only reason this works at
+ * all -- the vendor resets this SoC from the modem coprocessor. Register
+ * names are the vendor's (reg_md_sysctrl_rda8810.h); the kernel does the same
+ * two writes from drivers/power/reset/rda8810pl-restart.c.
+ */
+#define RDA_MD_SYSCTRL_BASE		0x11a00000
+#define RDA_SYSCTRL_REG_DBG		0x00
+#define RDA_SYSCTRL_SYS_RST_SET		0x04
+#define RDA_SYSCTRL_PROTECT_UNLOCK	0x00a50001
+#define RDA_SYSCTRL_SOFT_RST		(1u << 31)
+
 void reset_cpu(void)
 {
+	void __iomem *base = (void __iomem *)RDA_MD_SYSCTRL_BASE;
+
+	writel(RDA_SYSCTRL_PROTECT_UNLOCK, base + RDA_SYSCTRL_REG_DBG);
+	writel(RDA_SYSCTRL_SOFT_RST, base + RDA_SYSCTRL_SYS_RST_SET);
+
 	while (1)
 		;
 }
