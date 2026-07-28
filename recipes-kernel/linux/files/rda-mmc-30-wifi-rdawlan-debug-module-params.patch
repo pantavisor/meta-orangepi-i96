@@ -1,0 +1,51 @@
+From ade7849df049c152b76a8ab3f5b6acd054936a34 Mon Sep 17 00:00:00 2001
+From: Sergio Marin <sergio.marin@pantacor.com>
+Date: Tue, 28 Jul 2026 15:00:40 -0400
+Subject: [PATCH] wifi: rdawlan: make the debug verbosity a module parameter
+
+The driver's own tracing is the only practical window into the WID
+exchange with the chip. Expose wland_dbg_level and wland_dbg_area as
+module parameters so a built-in build can raise them from the kernel
+command line:
+
+  rdawfmac.wland_dbg_level=5
+
+The default stays at ERROR, so a normal boot is unchanged.
+
+Upstream-Status: Inappropriate [local forward-port of vendor driver]
+---
+ drivers/net/wireless/rdaw80211/rdawlan/wland_dbg.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/drivers/net/wireless/rdaw80211/rdawlan/wland_dbg.c b/drivers/net/wireless/rdaw80211/rdawlan/wland_dbg.c
+index 40a5dc8d72d5..5ecbc9e21383 100644
+--- a/drivers/net/wireless/rdaw80211/rdawlan/wland_dbg.c
++++ b/drivers/net/wireless/rdaw80211/rdawlan/wland_dbg.c
+@@ -17,6 +17,7 @@
+ 
+ #include <linuxver.h>
+ #include <linux/kernel.h>
++#include <linux/moduleparam.h>
+ #include <linux/if_arp.h>
+ #include <linux/netdevice.h>
+ #include <linux/etherdevice.h>
+@@ -40,7 +41,16 @@ int wland_dbg_area = WLAND_DATA_VAL |
+ 	WLAND_WEXT_VAL |
+ 	WLAND_DEFAULT_VAL | WLAND_SDIO_VAL | WLAND_CFG80211_VAL;
+ 
++/*
++ * Bring-up aid: overridable on the kernel command line as
++ * rdawfmac.wland_dbg_level=<n> (see WLAND_*_LEVEL in wland_dbg.h). The
++ * default stays at ERROR so a normal boot is quiet.
++ */
+ int wland_dbg_level = WLAND_ERROR_LEVEL;
++module_param(wland_dbg_level, int, 0644);
++MODULE_PARM_DESC(wland_dbg_level, "rdawlan debug verbosity");
++module_param_named(wland_dbg_area, wland_dbg_area, int, 0644);
++MODULE_PARM_DESC(wland_dbg_area, "rdawlan debug area mask");
+ int wland_dump_area =
+ 	//WLAND_TX_CTRL_AREA                    |
+ 	//WLAND_TX_MSDU_AREA                   |
+-- 
+2.55.0
+

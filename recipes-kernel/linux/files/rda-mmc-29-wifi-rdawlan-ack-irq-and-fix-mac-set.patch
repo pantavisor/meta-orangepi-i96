@@ -1,0 +1,123 @@
+From bb1896b149740d7a118f61a668c8e6dffd7a8c77 Mon Sep 17 00:00:00 2001
+From: Sergio Marin <sergio.marin@pantacor.com>
+Date: Tue, 28 Jul 2026 12:51:01 -0400
+Subject: [PATCH] wifi: rdawlan: ack the chip interrupt when not ready, and set
+ the MAC properly
+
+Two defects found on the second hardware boot.
+
+1. Interrupt livelock. wland_sdioh_irqhandler() returned immediately
+   when bus->intr was false, without touching the chip. The card holds
+   its interrupt asserted on DAT1 until the pending bits are cleared, so
+   the MMC core re-enabled the SDIO interrupt after the handler, the card
+   fired again at once, and the loop starved everything else -- 'sched:
+   RT throttling activated', and the driver's own registration handshake
+   then missed its 9 s timeout and tore the interface down again.
+
+   The vendor never saw this because rda_mmc_set_sdio_irq() masked the
+   interrupt at the host controller for exactly that window; a
+   mainline-style host has no such export. Acknowledge the pending bits
+   before returning instead.
+
+2. netdev->dev_addr has been const since 5.17 and must go through the
+   address-list helpers. Four direct memcpy() sites corrupted the
+   bookkeeping, which free_netdev() caught:
+
+     wlan0 (unregistered): Incorrect netdev->dev_addr
+     WARNING at net/core/dev_addr_lists.c:519 dev_addr_check
+
+   Use dev_addr_mod(), which updates both the address and the list entry
+   and is safe before and after register_netdev().
+
+Progress on that boot: the interface reached 'wlan0 (unregistered)', so
+attach and netdev creation work; the teardown was a consequence of the
+timeout in (1).
+
+Upstream-Status: Inappropriate [local forward-port of vendor driver]
+---
+ .../wireless/rdaw80211/rdawlan/wland_linux.c  |  6 +++---
+ .../wireless/rdaw80211/rdawlan/wland_sdio.c   | 20 +++++++++++++++++--
+ .../wireless/rdaw80211/rdawlan/wland_wid.c    |  2 +-
+ 3 files changed, 22 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/net/wireless/rdaw80211/rdawlan/wland_linux.c b/drivers/net/wireless/rdaw80211/rdawlan/wland_linux.c
+index 164dcf590b9f..e907cdabc3b9 100644
+--- a/drivers/net/wireless/rdaw80211/rdawlan/wland_linux.c
++++ b/drivers/net/wireless/rdaw80211/rdawlan/wland_linux.c
+@@ -187,7 +187,7 @@ static void _wland_set_mac_address(struct work_struct *work)
+ 	} else {
+ 		WLAND_DBG(DEFAULT, TRACE, "MAC address updated to %pM\n",
+ 			ifp->mac_addr);
+-		memcpy(ifp->ndev->dev_addr, ifp->mac_addr, ETH_ALEN);
++		dev_addr_mod(ifp->ndev, 0, ifp->mac_addr, ETH_ALEN);
+ 	}
+ }
+ 
+@@ -728,7 +728,7 @@ int netdev_attach(struct wland_if *ifp)
+ 	/*
+ 	 * set the mac address
+ 	 */
+-	memcpy(ndev->dev_addr, ifp->mac_addr, ETH_ALEN);
++	dev_addr_mod(ndev, 0, ifp->mac_addr, ETH_ALEN);
+ 
+ 	WLAND_DBG(DEFAULT, TRACE, "Enter,(%s:idx:%d,ifidx:0x%x)\n", ndev->name,
+ 		ifp->bssidx, ifp->ifidx);
+@@ -847,7 +847,7 @@ int netdev_p2p_attach(struct wland_if *ifp)
+ 	/*
+ 	 * set the mac address
+ 	 */
+-	memcpy(ndev->dev_addr, ifp->mac_addr, ETH_ALEN);
++	dev_addr_mod(ndev, 0, ifp->mac_addr, ETH_ALEN);
+ 
+ 	WLAND_DBG(DEFAULT, TRACE, "Enter(idx:%d,mac:%pM)\n", ifp->bssidx,
+ 		ifp->mac_addr);
+diff --git a/drivers/net/wireless/rdaw80211/rdawlan/wland_sdio.c b/drivers/net/wireless/rdaw80211/rdawlan/wland_sdio.c
+index 224c8d9aaa9d..78ac98ecad4e 100644
+--- a/drivers/net/wireless/rdaw80211/rdawlan/wland_sdio.c
++++ b/drivers/net/wireless/rdaw80211/rdawlan/wland_sdio.c
+@@ -1364,11 +1364,27 @@ static void wland_sdioh_irqhandler(struct sdio_func *func)
+ 	}
+ 
+ 	/*
+-	 * Disable additional interrupts
++	 * Not ready to process interrupts yet -- but the source must still be
++	 * acknowledged. The card holds its interrupt asserted on DAT1 until
++	 * the pending bits are cleared, so simply returning here leaves the
++	 * line low: the MMC core re-enables the SDIO interrupt after this
++	 * handler, the card fires again immediately, and the result is a
++	 * livelock that shows up as "sched: RT throttling activated".
++	 *
++	 * The vendor got away with this because rda_mmc_set_sdio_irq() masked
++	 * the interrupt at the host controller for exactly this window; that
++	 * export does not exist in a mainline-style host driver.
+ 	 */
+ 	if (!bus->intr) {
++		u8 val = 0;
++
++		if (!wland_sdio_intr_get(bus->sdiodev, &val) && val)
++			sdioh_request_byte(bus->sdiodev, SDIOH_WRITE,
++				URSDIO_FUNC1_INT_PENDING, &val);
++
+ 		WLAND_DBG(SDIO, INFO,
+-			"isr w/o interrupt is disabled, so do nothing and return\n");
++			"isr w/o interrupt enabled, acked 0x%x and returning\n",
++			val);
+ 		return;
+ 	}
+ 
+diff --git a/drivers/net/wireless/rdaw80211/rdawlan/wland_wid.c b/drivers/net/wireless/rdaw80211/rdawlan/wland_wid.c
+index a8273fe65a9e..a71b3d31439f 100644
+--- a/drivers/net/wireless/rdaw80211/rdawlan/wland_wid.c
++++ b/drivers/net/wireless/rdaw80211/rdawlan/wland_wid.c
+@@ -472,7 +472,7 @@ int wland_start_chip(struct wland_if *ifp, u8 device_role)
+ 		 * revert six bit of the byte
+ 		 */
+ 		ifp->mac_addr[5] ^= (1 << (5));
+-		memcpy(ifp->ndev->dev_addr, ifp->mac_addr, ETH_ALEN);
++		dev_addr_mod(ifp->ndev, 0, ifp->mac_addr, ETH_ALEN);
+ 	}
+ 
+ 	WLAND_DBG(DCMD, DEBUG, "Enter(device_role:0x%x)\n", device_role);
+-- 
+2.55.0
+

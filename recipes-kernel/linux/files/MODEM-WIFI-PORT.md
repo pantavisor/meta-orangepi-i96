@@ -961,3 +961,87 @@ This path had never been reachable: no SDIO card enumerated on this board
 until the pad map landed in u-boot (§15), and nothing claimed the SDIO IRQ
 until the WiFi driver existed. Worth keeping as a pattern — each stage that
 unblocks a path exposes the first real bug in the layer below it.
+
+### Follow-up: console baud (deferred until WiFi is done)
+
+The i96 runs its console at 921600, which is the outlier — the docs say
+"Most Pantavisor images default to 115200 8N1". Three places pin it and all
+three must change together:
+
+- `recipes-bsp/u-boot/files/rda8810-stage2/configs/*i96*`:
+  `CONFIG_BAUDRATE` and `CONFIG_DEBUG_UART_CLOCK`;
+- the board DT: `stdout-path = "serial2:921600n8"` **and** the `uart_clk`
+  fixed-clock node — this port feeds the baud in as the UART's clock rate, so
+  changing `stdout-path` alone is not enough;
+- the kernel cmdline follows u-boot's `${baudrate}` automatically.
+
+The vendor SPL in the first 72 KB of the bootloader blob is a binary we do not
+rebuild, so anything it prints stays at 921600; in practice it prints nothing.
+
+Deliberately deferred: 921600 is useful while bringing WiFi up, because
+`rdawfmac.wland_dbg_level=5` is chatty enough that at 115200 the console
+traffic would slow the driver past its own 5 s control-response timeout.
+
+---
+
+## 17. Stage 4 on hardware: where it stands (2026-07-24, end of session)
+
+The driver binds, creates `wlan0`, and talks to the chip. It stops at one
+specific step: the **core init patch never gets a response**.
+
+```
+wland_sdio_probe: Chipid: 0x6(RDA5991_G)        <- driver reads the chip over SDIO
+wland_bus_start: nvram:get a random ether address
+netdev_attach: wlan0: Rdamicro Host Driver(mac:ce:17:d8:a4:de:ba)
+wland_sdio_bus_txctl: ctrl_frame_stat == false, send success   <- WID command goes out
+wland_sdio_bus_rxctl: resumed on timeout                       <- 5 s, no answer
+wland_set_core_init_patch: WID Result Failed
+wland_sdio_trap_attach: wland_sdio_core_patch_attach failed!
+```
+
+### What the verbose trace proves (`rdawfmac.wland_dbg_level=5`, patch 30)
+
+- **Polling works.** `Wake up watchdog thread!` every 20 ms,
+  `bus->poll:1, pollrate:1`. This matters because `bus->intr` is *false*
+  during the patch download (it is only set after `trap_attach` succeeds), so
+  the response is meant to arrive via polling, not the interrupt.
+- **The chip is alive at the SDIO register level.** `wland_sdio_flow_ctrl_91e`
+  reads `INT_PENDING` as `0xc0` on the first attempt and `0xd0` on the second,
+  so the chip is updating its own registers between attempts.
+- **The TX succeeds.** `WRITE: addr=0x00007, length=128, ret:0`.
+- **The chip never signals data.** Every poll reads `INT_STATUS = 0x0`;
+  `I_AHB2SDIO` (BIT0) is never set after the command. It *was* set once, at
+  chip wake-up, before the command went out.
+
+So: command sent, chip responsive to register access, core never answers.
+
+### Eliminated, each by direct measurement
+
+| Suspect | Result |
+|---------|--------|
+| Interrupt storm / RT livelock | fixed (patches 28+29); boot 81 s → 13.5 s, no `RT throttling` |
+| `netdev->dev_addr` corruption | fixed (patch 29); the `free_netdev` WARNING is gone |
+| Watchdog/poll not running | **disproven** — it runs at 20 ms throughout |
+| md_sysctrl 26 MHz / 32 kHz gates | **actively harmful**: with `rdacombo clocks` applied, SDIO does not even enumerate (`mmc1: Failed to initialize`). Confirms removing them from the u-boot latch was right |
+| **The modem** | **exonerated for the core too.** Booted the vendor card *with* `mdcom_loadm` and our stage-4 kernel: identical failure at 8.48 s. Note the MAC line changes to a single `get invalid wifi mac address` instead of three `can not get` retries — proof the msys command actually reached a running modem and returned data. §15's conclusion holds for the core, not just enumeration |
+| Wrong chip-variant flow control | disproven: `wland_sdio_flow_ctrl()` dispatches 91E/91F/**91G** to `_91e`, which is what runs |
+
+### Next moves, in order
+
+1. **Compare the WID frame we send against the vendor's byte for byte.** The
+   vendor system can be made to dump it (`wland_dbg_area` has TX_CTRL /
+   RX_WIDRSP areas, and `WLAND_DUMP` prints frames). Same command, same chip:
+   if our 118-byte frame differs, that is the bug.
+2. **Check the chip-kick after the data write.** The trace shows the payload
+   written to `addr 0x07` with no following `URSDIO_FUNC1_INT_TO_DEVICE`
+   (`addr 0x09`) write; `addr 0x09` is only written by `wland_chip_wake_up`.
+   Confirm from the vendor trace whether a kick is expected there.
+3. **Sanity-check `wland_write_sdio32_polling()`**, the caller — it is a
+   polling-style register write path and the most likely place for a
+   forward-port slip that the compiler could not catch.
+
+### Bench aids that made this tractable
+
+- `rdawfmac.wland_dbg_level=5` on the kernel command line (patch 30).
+- The vendor card boots our kernel via `pv-zImage-dtb`, with or without
+  `mdcom_loadm`, which is how the modem was isolated as a variable.
