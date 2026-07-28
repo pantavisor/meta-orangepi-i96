@@ -1098,7 +1098,7 @@ can have are wrong:
 | ISR behaviour | Result |
 |---|---|
 | return without acking (vendor, and us before patch 29) | card holds DAT1 asserted, core re-enables after the handler, line storms → `sched: RT throttling activated` |
-| ack and return (patch 29) | `I_AHB2SDIO` is **write-1-to-clear** — writing back what `INT_STATUS` reported clears the indication before the 20 ms poll sees it. Response sits unread in the RD FIFO; `INT_STATUS` reads 0x0 forever |
+| ack and return (patch 29) | `I_AHB2SDIO` is **write-1-to-clear** — writing back what `INT_STATUS` reported clears the indication without ever reading the RD FIFO, so the frame is never collected and `INT_STATUS` reads 0x0 forever |
 
 The header comment is explicit and was the giveaway: *"Indicates that data
 transfer from AHB to SD is pending. Cleared by Host by writing a '1' into
@@ -1129,12 +1129,85 @@ Patch 31:
 `sdio_release_irq()` is a no-op when the IRQ was never claimed, so the
 test-mode path (which never sets `bus->intr`) needs no change.
 
-**Not yet confirmed on hardware.** The decisive check on the next boot is
-whether the patch-29 log line `isr w/o interrupt enabled, acked 0x..` appears
-in the pre-fix trace — it prints at `SDIO`/`INFO`, which `wland_dbg_level=5`
-enables and the default `wland_dbg_area` includes. If it is there, this is
-confirmed; if it is absent, the ISR was not firing in that window and the
-diagnosis is wrong.
+### CONFIRMED on hardware, with the mechanism corrected (2026-07-28, later)
+
+The falsification check was run against the **patch-29** image at
+`wland_dbg_level=5`, and the line is there — exactly once:
+
+```
+[3.420000] [RDAWLAN_SDIO]:<wland_sdioh_irqhandler,1385>  isr w/o interrupt enabled, acked 0x1 and returning
+```
+
+`0x1` is `I_AHB2SDIO`. But the timeline shows the guess above was wrong about
+*which* frame was lost:
+
+```
+3.400  bus_init -> intr_register: REGISTER_MASK=0x07, claims the IRQ
+3.410  core-init WID built, 118 bytes, txctl queued
+3.420  chip_wake_up -> SDIO IRQ fires, bus->intr == false
+         read  INT_STATUS  (0x06) = 0x1   <- a frame is ALREADY pending
+         write INT_PENDING (0x05) = 0x1   <- flag cleared, FIFO never read
+3.450  118-byte payload -> WR FIFO, ret 0
+3.470+ poller reads INT_STATUS: 0x0, 0x0, 0x0, ... forever
+8.540  second attempt, identical
+```
+
+The ack happened **before** the command went out, so it did not eat the WID
+response — the response never came. What it ate was the frame indication
+already pending at chip wake-up. §17 recorded that bit as an incidental
+detail ("it *was* set once, at chip wake-up"); it is in fact the whole story.
+
+`wland_sdio_readframes()` is called **zero times** in the entire trace, and
+there is not one read of the RD FIFO (`addr 0x08`). On the vendor, with no
+ISR claiming the IRQ, the 20 ms poller sees `INT_STATUS = 0x1`, calls
+`wland_sdio_readframes()`, reads `RPKTLEN` and **drains the FIFO**. Patch 29
+clears the flag and leaves the packet in place, so the chip's AHB2SDIO
+engine still holds an undelivered frame and never signals another.
+
+So the fix is unchanged but its prediction is now sharp: with patch 31 the
+poller should run at ~3.44 s, before the payload write, and the trace should
+contain `received buffer size:N`. **If that line appears and the WID still
+fails, this diagnosis is wrong too.**
+
+### Driving the board without a reflash
+
+Worth keeping — the whole check above was done over the serial console with
+no rebuild:
+
+- `stty -F /dev/ttyUSB1 921600 raw -echo`, then `cat` to capture and
+  `printf ... > /dev/ttyUSB1` to type. picocom is not needed and holding the
+  port with picocom would block this.
+- `reboot -f` **halts the board**; mainline 6.6 has no RDA restart handler,
+  so it needs a physical power cycle afterwards. Do not use it.
+- To change the cmdline for one boot: interrupt autoboot (spam a bare space
+  during power-on), then replay `boot.scr` by hand with the param appended.
+  There is no saved environment (`/uboot.env` is absent, the built-in default
+  from `include/configs/rda8810pl.h` is used), so nothing persists anyway:
+
+```
+setenv bootargs "earlycon console=${console},${baudrate} root=/dev/ram rootfstype=ramfs rdinit=/usr/bin/pantavisor pv_storage.device=/dev/mmcblk0p2 pv_storage.fstype=ext4 panic=3 rdawfmac.wland_dbg_level=5"
+load mmc 0:1 ${kernel_addr_r} zImage
+load mmc 0:1 ${fdt_addr_r} ${fdtfile}
+load mmc 0:1 ${ramdisk_addr_r} uInitrd
+bootz ${kernel_addr_r} ${ramdisk_addr_r} ${fdt_addr_r}
+```
+
+- Which patches are in a flashed image can be read straight off the console:
+  `WLAND_ERR` prints `<function,line>`, and patch 31 moves the `Chipid:` line
+  in `wland_sdio_probe` from **1631** to **1661**. That is how the first
+  "built and flashed" image was identified as pre-31.
+- No rebind loop is available after a failure: `wlanfmac_module_init` reports
+  `sdio_register_driver timeout or error` at 12.6 s and unregisters the
+  driver, so `/sys/bus/sdio/drivers/` ends up empty. The driver is built-in,
+  so a reboot is the only way to re-probe.
+
+### Separate issue, visible in the same trace
+
+`wlanfmac_module_init: sdio_register_driver timeout or error` fires at
+12.64 s, *before* the second WID attempt completes at 13.52 s. That
+registration semaphore has its own ~9 s timeout and the two 5 s WID retries
+overrun it. Fixing the WID response should hide this, but the margin is thin
+— watch for it if attach is ever slow.
 
 ### Method note
 
