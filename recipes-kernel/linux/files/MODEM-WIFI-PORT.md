@@ -1045,3 +1045,103 @@ So: command sent, chip responsive to register access, core never answers.
 - `rdawfmac.wland_dbg_level=5` on the kernel command line (patch 30).
 - The vendor card boots our kernel via `pv-zImage-dtb`, with or without
   `mdcom_loadm`, which is how the modem was isolated as a variable.
+
+---
+
+## 18. The three next moves, worked (2026-07-28)
+
+All three were answered from source. Two came back negative; the third did
+not survive contact with the code, but chasing it found the actual bug —
+in patch 29, our own fix for the interrupt storm.
+
+The tree to read them in is reconstructible without a build: apply patch 26
+to an empty git repo (excluding the two pre-existing `rdaw80211/Kconfig` and
+`Makefile` hunks), commit, then apply 27. Vendor and port are then two
+commits and any function can be diffed directly.
+
+### Move 1 — the WID frame cannot differ
+
+No dump needed. The whole construction path is in files **patch 27 does not
+touch**: `wland_set_core_init_patch()` and `wland_write_sdio32_polling()` in
+`wland_trap.c`, `wland_proto_cdc_data()` and `wland_wid_hdrpush()` in
+`wland_cmds.c`. They are byte-identical to the vendor. `wland_sdio.c` is
+touched, but only for `timer_setup()` and the patch-29 ISR change — the
+txctl path is untouched too.
+
+### Move 2 — no chip-kick is expected
+
+`URSDIO_FUNC1_INT_TO_DEVICE` (0x09) is written in exactly two places in the
+vendor tree: `wland_chip_wake_up()`, and the power-manager tail of
+`wland_preinit_cmds()`, which runs *after* the patch download and only under
+`WLAND_POWER_MANAGER`. The TX path (`wland_sdio_send_pkt()`) writes
+`SPKTLEN_LO`/`SPKTLEN_HI` and then the WR FIFO, and stops there — the length
+registers are the trigger. Our trace matches the vendor code exactly.
+
+### Move 3 — wrong file, right instinct
+
+`wland_write_sdio32_polling()` lives in `wland_trap.c`, which the
+forward-port never touched, so no slip was possible. But the question "who
+else could be eating this response" pointed at the one thing in the path
+that *was* changed.
+
+### RESOLUTION: patch 29's ack was clearing the frame indication
+
+`wland_sdio_bus_init()` claimed the function IRQ, but `bus->intr` stays
+false until `wland_sdio_trap_attach()` succeeds. **The entire core init
+patch download runs in polling mode** — `wland_sdio_watchdog_thread()` is
+what is meant to see `I_AHB2SDIO` in `INT_STATUS` and pull the frame out of
+the RD FIFO.
+
+So the ISR fires in a window where it must not act, and both behaviours it
+can have are wrong:
+
+| ISR behaviour | Result |
+|---|---|
+| return without acking (vendor, and us before patch 29) | card holds DAT1 asserted, core re-enables after the handler, line storms → `sched: RT throttling activated` |
+| ack and return (patch 29) | `I_AHB2SDIO` is **write-1-to-clear** — writing back what `INT_STATUS` reported clears the indication before the 20 ms poll sees it. Response sits unread in the RD FIFO; `INT_STATUS` reads 0x0 forever |
+
+The header comment is explicit and was the giveaway: *"Indicates that data
+transfer from AHB to SD is pending. Cleared by Host by writing a '1' into
+this register location."*
+
+That is every symptom in §17: TX succeeds, chip alive at register level,
+`INT_STATUS` always 0x0, `I_AHB2SDIO` set exactly once — at wake-up, before
+the IRQ started being consumed — and a 5 s rxctl timeout.
+
+The vendor never had to choose, because `rda_mmc_set_sdio_irq()` masked the
+SDIO interrupt at the host controller for exactly this window. §16 listed
+that no-op shim as a known limitation and guessed the fix would be
+"release/re-claim the function IRQ there rather than reaching into the host
+driver" — which is what patch 31 does, in the simpler direction: **never
+claim it in the first place until the driver leaves polling mode.**
+
+Patch 31:
+
+- `wland_sdio_intr_register()` keeps writing the chip's `REGISTER_MASK` at
+  bus init (so the polling path still sees status bits) but no longer calls
+  `sdio_claim_irq()`;
+- a new `wland_sdio_intr_enable()` claims it, called from `wland_wid.c`
+  right where `bus->intr = true` is set — the exact spot the vendor called
+  `rda_mmc_set_sdio_irq(1, true)`;
+- the `!bus->intr` branch of the ISR goes back to a bare return, now
+  unreachable during bring-up, with a comment on why it must stay bare.
+
+`sdio_release_irq()` is a no-op when the IRQ was never claimed, so the
+test-mode path (which never sets `bus->intr`) needs no change.
+
+**Not yet confirmed on hardware.** The decisive check on the next boot is
+whether the patch-29 log line `isr w/o interrupt enabled, acked 0x..` appears
+in the pre-fix trace — it prints at `SDIO`/`INFO`, which `wland_dbg_level=5`
+enables and the default `wland_dbg_area` includes. If it is there, this is
+confirmed; if it is absent, the ISR was not firing in that window and the
+diagnosis is wrong.
+
+### Method note
+
+The bug was introduced by the previous fix, one commit earlier, and neither
+the compiler nor the boot log flagged it — patch 29 removed a livelock and
+looked like a clean win. What found it was reconstructing vendor and port as
+two git commits and asking *what did we change in this path*, rather than
+*what is wrong with this path*. §16 records the same lesson from the other
+direction: each stage that unblocks a path exposes the first real bug in the
+layer below. Here the layer below was us.

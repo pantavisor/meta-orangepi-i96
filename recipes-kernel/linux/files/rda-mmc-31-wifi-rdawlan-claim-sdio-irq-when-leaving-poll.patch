@@ -1,0 +1,201 @@
+From 0d566fd12b2b791520c5956174e8c3063289f53f Mon Sep 17 00:00:00 2001
+From: Sergio Marin <sergio.marin@pantacor.com>
+Date: Tue, 28 Jul 2026 15:12:42 -0400
+Subject: [PATCH] wifi: rdawlan: do not claim the SDIO IRQ while polling
+
+The core init patch download never got its WID response. The command went
+out (128-byte write to the WR FIFO returned 0) and the chip stayed alive at
+the register level (INT_PENDING moved 0xc0 -> 0xd0 between attempts), but
+every watchdog poll read INT_STATUS as 0x0, I_AHB2SDIO never appeared, and
+wland_sdio_bus_rxctl() timed out after 5 s:
+
+  wland_sdio_bus_txctl: ctrl_frame_stat == false, send success
+  wland_sdio_bus_rxctl: resumed on timeout
+  wland_set_core_init_patch: WID Result Failed
+  wland_sdio_trap_attach: wland_sdio_core_patch_attach failed!
+
+The response was being thrown away by our own interrupt handler.
+
+wland_sdio_bus_init() claimed the function IRQ, but bus->intr stays false
+until wland_sdio_trap_attach() has succeeded -- the whole patch download
+runs in polling mode, and wland_sdio_watchdog_thread() is what is supposed
+to see I_AHB2SDIO in INT_STATUS and pull the frame out of the RD FIFO.
+
+That leaves the ISR firing in a window where it must not do anything, and
+both available behaviours are wrong:
+
+  - return without acking: the card holds its interrupt asserted on DAT1
+    until the pending bits are cleared, the MMC core re-enables the SDIO
+    interrupt after the handler, and the line storms ('sched: RT throttling
+    activated'). This was the vendor code, and the bug fixed in patch 29.
+
+  - ack and return: I_AHB2SDIO is write-1-to-clear, so writing back what
+    INT_STATUS reported clears the frame indication before the poller can
+    see it. The response sits unread in the RD FIFO and the poll finds
+    INT_STATUS == 0x0 forever. This was patch 29's fix, and it is what has
+    been eating the core init response ever since.
+
+The vendor never had to choose, because rda_mmc_set_sdio_irq() masked the
+SDIO interrupt at the host controller for exactly this window. A
+mainline-style host driver exports no such thing, but it does not need to:
+not claiming the function IRQ has the same effect, since the MMC core only
+enables SDIO interrupt delivery for a claimed function.
+
+So claim the IRQ where the vendor unmasked it -- next to bus->intr = true,
+once the chip is trapped and polling is switched off. wland_sdio_intr_
+register() keeps writing the chip's REGISTER_MASK at bus init, exactly as
+before, so the polling path still sees the status bits.
+
+The !bus->intr branch in the ISR becomes unreachable during bring-up and
+goes back to a bare return, with a comment saying why it must stay that
+way. sdio_release_irq() in wland_sdio_intr_unregister() is safe when the
+IRQ was never claimed, so the test-mode path (which never sets bus->intr)
+needs no change.
+
+Upstream-Status: Inappropriate [local forward-port of vendor driver]
+---
+ .../wireless/rdaw80211/rdawlan/wland_sdio.c   | 66 ++++++++++++++-----
+ .../wireless/rdaw80211/rdawlan/wland_sdmmc.h  |  3 +-
+ .../wireless/rdaw80211/rdawlan/wland_wid.c    |  8 ++-
+ 3 files changed, 57 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/net/wireless/rdaw80211/rdawlan/wland_sdio.c b/drivers/net/wireless/rdaw80211/rdawlan/wland_sdio.c
+index 78ac98e..8e15bda 100644
+--- a/drivers/net/wireless/rdaw80211/rdawlan/wland_sdio.c
++++ b/drivers/net/wireless/rdaw80211/rdawlan/wland_sdio.c
+@@ -1364,27 +1364,19 @@ static void wland_sdioh_irqhandler(struct sdio_func *func)
+ 	}
+ 
+ 	/*
+-	 * Not ready to process interrupts yet -- but the source must still be
+-	 * acknowledged. The card holds its interrupt asserted on DAT1 until
+-	 * the pending bits are cleared, so simply returning here leaves the
+-	 * line low: the MMC core re-enables the SDIO interrupt after this
+-	 * handler, the card fires again immediately, and the result is a
+-	 * livelock that shows up as "sched: RT throttling activated".
++	 * Defensive only. The function IRQ is not claimed until bus->intr is
++	 * set (see wland_sdio_intr_enable()), precisely so that this branch
++	 * cannot run while the driver is in polling mode.
+ 	 *
+-	 * The vendor got away with this because rda_mmc_set_sdio_irq() masked
+-	 * the interrupt at the host controller for exactly this window; that
+-	 * export does not exist in a mainline-style host driver.
++	 * It must stay a bare return. Acknowledging the pending bits here
++	 * destroys the poller's frame indication: I_AHB2SDIO is write-1-to-
++	 * clear, so writing back what INT_STATUS reported clears the very bit
++	 * wland_sdio_watchdog_thread() is waiting on, and the frame is never
++	 * read out of the RD FIFO.
+ 	 */
+ 	if (!bus->intr) {
+-		u8 val = 0;
+-
+-		if (!wland_sdio_intr_get(bus->sdiodev, &val) && val)
+-			sdioh_request_byte(bus->sdiodev, SDIOH_WRITE,
+-				URSDIO_FUNC1_INT_PENDING, &val);
+-
+ 		WLAND_DBG(SDIO, INFO,
+-			"isr w/o interrupt enabled, acked 0x%x and returning\n",
+-			val);
++			"isr w/o interrupt is disabled, so do nothing and return\n");
+ 		return;
+ 	}
+ 
+@@ -1439,12 +1431,29 @@ static void wland_sdioh_irqhandler(struct sdio_func *func)
+ 		atomic_read(&bus->rx_dpc_tskcnt));
+ }
+ 
++/*
++ * Unmask the chip's interrupt sources, but do NOT claim the function IRQ
++ * yet. Between here and the end of wland_sdio_trap_attach() the driver runs
++ * in polling mode (bus->intr is false, bus->poll is true): the core init
++ * patch download expects wland_sdio_watchdog_thread() to observe I_AHB2SDIO
++ * in INT_STATUS and read the WID response out of the RD FIFO itself.
++ *
++ * Claiming the IRQ here makes that unwinnable. The card holds its interrupt
++ * asserted on DAT1 until the pending bits are cleared, so an ISR that runs
++ * in this window has only two choices, and both are wrong: return without
++ * acking and livelock ("sched: RT throttling activated"), or ack and clear
++ * I_AHB2SDIO out from under the poller so the response is never collected.
++ *
++ * The vendor avoided this with rda_mmc_set_sdio_irq(), which masked the SDIO
++ * interrupt at the host controller for exactly this window; a mainline-style
++ * host driver has no such export. Not claiming the IRQ until the driver
++ * actually wants interrupts is the same thing, expressed in MMC core terms.
++ */
+ int wland_sdio_intr_register(struct wland_sdio_dev *sdiodev)
+ {
+ 	int ret;
+ 
+ 	sdio_claim_host(sdiodev->func);
+-	sdio_claim_irq(sdiodev->func, wland_sdioh_irqhandler);
+ 	ret = wland_sdio_intr_set(sdiodev, true);
+ 	sdio_release_host(sdiodev->func);
+ 
+@@ -1453,6 +1462,27 @@ int wland_sdio_intr_register(struct wland_sdio_dev *sdiodev)
+ 	return ret;
+ }
+ 
++/*
++ * Switch from polling to interrupts. Called once the chip is trapped and
++ * bus->intr has been set, which is where the vendor called
++ * rda_mmc_set_sdio_irq(1, true).
++ */
++int wland_sdio_intr_enable(struct wland_sdio_dev *sdiodev)
++{
++	int ret;
++
++	sdio_claim_host(sdiodev->func);
++	ret = sdio_claim_irq(sdiodev->func, wland_sdioh_irqhandler);
++	sdio_release_host(sdiodev->func);
++
++	if (ret)
++		WLAND_ERR("sdio_claim_irq failed:%d\n", ret);
++
++	WLAND_DBG(SDIO, TRACE, "Done(ret:%d)\n", ret);
++
++	return ret;
++}
++
+ int wland_sdio_intr_unregister(struct wland_sdio_dev *sdiodev)
+ {
+ 
+diff --git a/drivers/net/wireless/rdaw80211/rdawlan/wland_sdmmc.h b/drivers/net/wireless/rdaw80211/rdawlan/wland_sdmmc.h
+index 202ab17..bc9a8ad 100644
+--- a/drivers/net/wireless/rdaw80211/rdawlan/wland_sdmmc.h
++++ b/drivers/net/wireless/rdaw80211/rdawlan/wland_sdmmc.h
+@@ -55,7 +55,7 @@
+ 
+ /* intstatus Mask */
+ #define I_AHB2SDIO                      BIT0	/* Indicates that data transfer from AHB to SD is
+-						 * pending Cleared by Host by writing a „1. into
++						 * pending Cleared by Host by writing a ï¿½1. into
+ 						 * this register location */
+ #define I_ERROR                         BIT2	/* Indicates that a system error has occurred in
+ 						 * the device and needs to be handled. */
+@@ -244,6 +244,7 @@ static inline uint wland_get_align_size(struct wland_sdio *bus, uint count)
+ 
+ /* Register/deregister interrupt handler. */
+ extern int wland_sdio_intr_register(struct wland_sdio_dev *sdiodev);
++extern int wland_sdio_intr_enable(struct wland_sdio_dev *sdiodev);
+ extern int wland_sdio_intr_unregister(struct wland_sdio_dev *sdiodev);
+ 
+ extern void wland_sdio_wd_timer(struct wland_sdio *bus, uint wdtick);
+diff --git a/drivers/net/wireless/rdaw80211/rdawlan/wland_wid.c b/drivers/net/wireless/rdaw80211/rdawlan/wland_wid.c
+index a71b3d3..17f11c2 100644
+--- a/drivers/net/wireless/rdaw80211/rdawlan/wland_wid.c
++++ b/drivers/net/wireless/rdaw80211/rdawlan/wland_wid.c
+@@ -493,7 +493,13 @@ int wland_start_chip(struct wland_if *ifp, u8 device_role)
+ 		bus->intr = true;
+ 		bus->poll = false;
+ #ifdef WLAND_SDIO_SUPPORT
+-		rda_mmc_set_sdio_irq(1, true);
++		/*
++		 * The chip is trapped and the driver is done polling, so the
++		 * function IRQ can finally be claimed. This is where the
++		 * vendor called rda_mmc_set_sdio_irq(1, true) to unmask the
++		 * SDIO interrupt at its host controller.
++		 */
++		wland_sdio_intr_enable(sdiodev);
+ #endif /*WLAND_SDIO_SUPPORT */
+ 	}
+ 
