@@ -915,3 +915,49 @@ Flash and boot, then look for the SDIO function binding to `rdawfmac` after
 `mmc1: new SDIO card`, a `wlan0` in `ip link`, and `iw dev wlan0 scan`
 returning APs. Definition of done is unchanged from §8: WPA2 association plus
 DHCP.
+
+### First hardware contact (2026-07-24 evening)
+
+The driver bound and talked to the chip:
+
+```
+mmc1: new SDIO card at address 4829
+[RDAWLAN_ERR]:<wland_sdio_probe,1615>: ------- Chipid: 0x6(RDA5991_G) -------
+[RDAWLAN_ERR]:<wlan_read_mac_from_nvram,112>: nvram:can not get wifi mac from nvram   (x3)
+[RDAWLAN_ERR]:<wland_bus_start,104>: nvram:get a random ether address
+[RDAWLAN_ERR]:<cfg80211_reg_notifier,5255>: reg_notifier for intiator:0 not supported
+[    5.000000] sched: RT throttling activated      <-- then wedged
+```
+
+Everything before the wedge is correct: the SDIO chip-id read is the ported
+driver using the data path, and the MAC fallback matches the vendor's own
+behaviour (three msys retries, then a random address) now that
+`wlan_read_mac_from_nvram()` goes through our msys client.
+
+**The hang was in our MMC host, not the WiFi port** (patch 28). `rda-mmc` only
+told the MMC core about an SDIO interrupt when a data request happened to be
+in flight:
+
+```c
+if (!priv->mrq || !priv->mrq->data)
+        goto irq_done;                  /* async card IRQ dropped here */
+...
+mmc_request_done(host, mrq);
+if (priv->sdio_irq && priv->sdio_irq_trigger)
+        mmc_signal_sdio_irq(host);      /* only ever reached with an mrq */
+```
+
+Card interrupts are asynchronous by definition, so the first real one was
+dropped. Clearing `SDMMC_INT_SDIO` in `INT_CLEAR` only clears the controller's
+latch — the card holds its interrupt asserted on DAT1 until the function
+handler services it, so the latch sets again immediately. The line storms, and
+since this is a threaded (RT priority) handler on a UP box, the system wedges.
+
+Fix: call `mmc_signal_sdio_irq()` from the hard handler *before* the request
+checks. It masks the SDIO interrupt and wakes the core's sdio_irq thread,
+which runs the function handler and re-enables.
+
+This path had never been reachable: no SDIO card enumerated on this board
+until the pad map landed in u-boot (§15), and nothing claimed the SDIO IRQ
+until the WiFi driver existed. Worth keeping as a pattern — each stage that
+unblocks a path exposes the first real bug in the layer below it.

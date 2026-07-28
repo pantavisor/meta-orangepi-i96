@@ -1,0 +1,97 @@
+From 0629fee2048356a221120fa40fbb567e28fd9bfa Mon Sep 17 00:00:00 2001
+From: Sergio Marin <sergio.marin@pantacor.com>
+Date: Tue, 28 Jul 2026 12:25:43 -0400
+Subject: [PATCH] mmc: rda: signal async SDIO card interrupts to the core
+
+An SDIO card interrupt arrives with no request in flight, but the
+handler bailed out at 'if (!priv->mrq || !priv->mrq->data)' before ever
+telling the MMC core, and the threaded half only signalled after
+mmc_request_done(). So an async card interrupt was never delivered.
+
+Clearing SDMMC_INT_SDIO in INT_CLEAR is not enough on its own: that
+clears the controller's latch, but the card holds its interrupt asserted
+on DAT1 until the function's handler services it, so the latch is set
+again immediately. The line then storms, and because this is a threaded
+(RT priority) handler on a UP box the whole system wedges -- observed as
+'sched: RT throttling activated' seconds after the rdawlan driver
+claimed the SDIO IRQ, with the console dead thereafter.
+
+Signal the core from the hard handler, before the request checks:
+mmc_signal_sdio_irq() masks the SDIO interrupt and wakes the core's
+sdio_irq thread, which runs the function handler and re-enables it.
+
+This path had never been exercised: no SDIO card enumerated on this
+board until the pad map landed in u-boot, and nothing claimed the SDIO
+IRQ until the WiFi driver arrived.
+
+Upstream-Status: Inappropriate [fixes a local backport]
+---
+ drivers/mmc/host/rda-mmc.c | 24 +++++++++++++++++-------
+ 1 file changed, 17 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/mmc/host/rda-mmc.c b/drivers/mmc/host/rda-mmc.c
+index 68a5a04dad24..fcaed86f503d 100644
+--- a/drivers/mmc/host/rda-mmc.c
++++ b/drivers/mmc/host/rda-mmc.c
+@@ -123,7 +123,6 @@ struct rda_mmc_host {
+ 	dma_addr_t bounce_dma;
+ 
+ 	bool sdio_irq;
+-	bool sdio_irq_trigger;
+ 
+ 	spinlock_t lock;
+ 	struct completion c;
+@@ -616,6 +615,23 @@ static irqreturn_t rda_mmc_irq(int irq, void *dev_id)
+ 
+ 	dev_dbg(dev, "IRQ requested - status: 0x%x\n", status);
+ 
++	/*
++	 * An SDIO card interrupt is asynchronous: it arrives with no request
++	 * in flight, so it must be handled before the mrq checks below.
++	 *
++	 * Clearing SDMMC_INT_SDIO in INT_CLEAR above only clears the
++	 * controller's latch -- the card keeps its interrupt asserted on DAT1
++	 * until the SDIO function's handler services it, so the latch is set
++	 * again immediately. mmc_signal_sdio_irq() is what breaks that loop:
++	 * it masks the SDIO interrupt (enable_sdio_irq(host, 0)) and wakes the
++	 * core's sdio_irq thread, which runs the function handler and
++	 * re-enables. Without it the line storms and, since this is a
++	 * threaded (RT priority) handler on a UP box, the system wedges with
++	 * "sched: RT throttling activated".
++	 */
++	if (priv->sdio_irq && (status & SDMMC_INT_SDIO))
++		mmc_signal_sdio_irq(host);
++
+ 	if (!priv->mrq || !priv->mrq->data)
+ 		goto irq_done;
+ 
+@@ -624,9 +640,6 @@ static irqreturn_t rda_mmc_irq(int irq, void *dev_id)
+ 	if (mrq->data && ((status & SDMMC_INT_RD_ERR) || (status & SDMMC_INT_WR_ERR)))
+ 		mrq->data->error = -EILSEQ;
+ 
+-	if (priv->sdio_irq && (status & SDMMC_INT_SDIO))
+-		priv->sdio_irq_trigger = true;
+-
+ 	irqret = IRQ_WAKE_THREAD;
+ 
+ 	/* We got an error, no need to do the additional checks */
+@@ -705,8 +718,6 @@ static irqreturn_t rda_mmc_irq_fn(int irq, void *dev_id)
+ 	complete(&priv->c);
+ 	mmc_request_done(host, mrq);
+ 
+-	if (priv->sdio_irq && priv->sdio_irq_trigger)
+-		mmc_signal_sdio_irq(host);
+ 
+ 	return IRQ_HANDLED;
+ }
+@@ -734,7 +745,6 @@ static void rda_mmc_sdio_enable_irq(struct mmc_host *host, int enable)
+ 		priv->sdio_irq = false;
+ 	}
+ 
+-	priv->sdio_irq_trigger = false;
+ 
+ 	writel(intmask, base + SDMMC_REG_INT_MASK);
+ }
+-- 
+2.55.0
+

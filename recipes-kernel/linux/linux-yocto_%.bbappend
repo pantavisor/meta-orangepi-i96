@@ -64,4 +64,5 @@ SRC_URI:append:orangepi-i96 = " \
 SRC_URI:append:orangepi-i96 = " \
     file://rda-mmc-26-wifi-rdawlan-import-vendor-driver.patch \
     file://rda-mmc-27-wifi-rdawlan-forward-port-to-6.6.patch \
+    file://rda-mmc-28-mmc-rda-signal-async-sdio-interrupts.patch \
 "
