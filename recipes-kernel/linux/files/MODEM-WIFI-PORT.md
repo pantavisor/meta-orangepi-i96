@@ -1287,3 +1287,110 @@ Written from the vendor headers, not yet run. Verify with `reboot` (should
 come back through u-boot) and `poweroff`. Do not confuse this soft reset with
 the APBI `SOFT_RST_L` pulse in the MMC wrapper, which is a different register
 and must not be touched — see the MMC bring-up notes.
+
+---
+
+## 20. Stage 4 core init WORKS; the next wall is `ifconfig wlan0 up` (2026-07-28)
+
+Patches 31 and 32 are both confirmed on hardware. §18's prediction held
+exactly.
+
+```
+mmc1: new SDIO card at address 4829
+[3.41] wland_sdio_trap_attach: Write core patch
+[3.47] wland_sdio_watchdog_thread: Frame Ind!
+[3.47] wland_sdio_readframes: received buffer size:16.     <- the poller drains it
+[6.85] wland_sdio_core_patch_attach: Done(ret:0)
+[8.41] Write additional patch finshed
+[8.41] wland_sdio_intr_enable: Done(ret:0)                 <- IRQ claimed at handover
+[8.48] wland_preinit_cmds: FirmWareVer:0x10202             <- chip firmware answers
+[8.55] Set MAC (a2:08:...) / [8.62] Get MAC — match
+[9.17] wland_start_chip: Done(err:0)
+[9.17] wland_bus_start: Done.(ret=0)
+```
+
+Counters over the whole boot: `WID Result Failed` **0** (was 2 every boot),
+`received buffer size` **87** (was 0), `isr w/o interrupt` **0**, no
+`RT throttling`. Stage 4's core init patch download is done.
+
+`reboot -f` also resets the board now (patch 32). Note plain `reboot`, which
+goes through init, returns to the prompt and does nothing on this image.
+
+### The bootloader trap that cost a flash cycle
+
+Worth recording because it looked exactly like a stage-3 regression. The
+first flash of the patch-31 kernel came up with `mmc1: Failed to initialize a
+non-removable card` and no WiFi device at all. The kernel was innocent: the
+image had been built with `bootloader-hybrid-debuguart.rda`, dated
+**2026-07-22**, while the five-register AP pad map that makes SDIO enumerate
+landed **2026-07-24** (§15, commits `0d17781` / `3e71486`). I2C and combo
+power still worked because that pinmux is older — which is precisely what
+made it look like the SDIO layer had broken again.
+
+**The `.rda` blobs in `recipes-bsp/u-boot/files/rda8810-spl/` are stale build
+artifacts. Never flash one without checking it.** The cheap check is to grep
+the blob for the pad constants as little-endian u32:
+
+```
+0x7fe0003f  0x000210fc  0x3f00033f  0x14040040  0x006e4524
+```
+
+The jul-22 blob contains none of them; a correctly rebuilt one contains all
+five. Rebuilding needs no vendor tooling — the layout is just concatenation:
+
+```
+.rda = [first 0x12000 bytes of a known-good .rda   = vendor SPL, keeps debug UART]
+     + [mkimage -A arm -O u-boot -T firmware -C none
+        -a 0x80008000 -e 0x80008000 -n u-boot -d <fresh u-boot.bin>]
+```
+
+`mkimage` is not installed on the dev host and the Yocto native one will not
+run there (uninative loader plus a missing `libssl`). A ~90-line Python
+reimplementation of the legacy header covers every type this board needs
+(ramdisk, script, firmware) and was validated byte-identical against real
+`mkimage` output before use.
+
+### NEXT: `ifconfig wlan0 up` hangs
+
+`wlan0` exists in `/sys/class/net`, but bringing it up never returns. The
+process enters uninterruptible sleep, `^C` does nothing, and the console
+stops emitting kernel output entirely — while the tty still **echoes** typed
+characters, so the kernel is alive and the stuck task is most likely holding
+`console_lock`. SysRq over serial break does not respond either
+(`MAGIC_SYSRQ_SERIAL=y` with an empty sequence, so break+key should work).
+Only a physical power cycle recovers it; `reboot -f` needs a working shell,
+so patch 32 does not help here.
+
+**Leading hypothesis: the interrupt path has never actually been exercised.**
+`bus->sdcnt.intrcount` stayed **0** for the entire boot — every frame came
+through the 20 ms poller while `bus->intr` was false. Patch 31 defers
+`sdio_claim_irq()` to `wland_sdio_intr_enable()` at the `bus->intr = true`
+handover, and immediately after that `bus->poll = false`. If IRQ delivery is
+not actually working, the driver goes deaf at exactly that moment, and
+`ndo_open` — which sends WIDs — blocks. That would make this patch 31's own
+residual failure mode rather than an unrelated bug.
+
+Against that reading: `wland_sdio_bus_rxctl()` waits with a timeout (that is
+what produced `resumed on timeout` in §17), so a merely deaf interrupt should
+give 5 s failures, not a permanent D state. A lock is the better fit. Both
+need checking:
+
+1. Does `bus->sdcnt.intrcount` ever increment after 8.41 s?
+2. Where exactly does `ndo_open` block — `dhd_os_wait_for_event()` in
+   `wland_sdio_bus_txctl()` has no obvious timeout, unlike the rxctl side.
+3. Does `sdio_claim_irq()` on an already-enumerated card with the chip's
+   `REGISTER_MASK` already set actually enable delivery through our
+   mainline-style `rda-mmc` host?
+
+### Bench tooling notes
+
+- The BSP console shell has only `/sbin/ifconfig` and `/bin/busybox` — no
+  `ip`, `iw` or `wpa_supplicant`. Association plus DHCP (§8's definition of
+  done) will need the `pvwificonnect` container, already built in
+  `deploy/images/orangepi-i96`.
+- The console moved from `/dev/ttyUSB1` to `/dev/ttyUSB3` (FT232R) mid-session
+  — four adapters are present, so confirm before capturing.
+- Never leave two readers on the port. A stale background `dd` plus a new one
+  splits the byte stream and the log is unreadable. Kill by PID; do **not**
+  `pkill -f "cat /dev/ttyUSB3"`, because the pattern matches the invoking
+  shell's own command line and kills it.
