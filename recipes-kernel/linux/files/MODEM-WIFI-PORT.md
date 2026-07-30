@@ -1578,3 +1578,46 @@ Likely fix, for the next session: drive a real off→on transition of the combo
 chip on init rather than assuming it is unpowered — the vendor sequence has a
 `wifi_power_off` that our probe path does not call first. §14 already
 exercised an OFF→ON transition by hand, so the pieces exist.
+
+### Cold-boot follow-up: two things still in the way (2026-07-28)
+
+A cold power cycle after the warm-reboot failure brings SDIO and `wlan0`
+straight back, which confirms the `-110` in the previous section is specific
+to the soft-reset path and not a latent enumeration problem.
+
+Two issues showed up on that boot, neither of them blocking the §8 result
+above but both blocking anything unattended:
+
+**1. The association does not come back by itself.** After the reboot the
+interface has `inet addr:169.254.224.21` — IPv4 link-local, connman's
+fallback when nothing was joined. The most likely cause is that
+`/var/lib/connman/home.config` was written into the `os` container's writable
+layer and did not survive, but that is **not verified** — the board rebooted
+again before it could be checked. First thing to confirm next session:
+
+```
+pventer -c os ls -l /var/lib/connman/
+```
+
+If the file is gone, the config belongs somewhere pantavisor persists, or the
+network should be provisioned through pvwificonnect rather than by hand.
+
+**2. The station MAC is random and changes on every boot.**
+
+```
+boot A:  HWaddr 6E:AB:BF:C2:2C:EB
+boot B:  HWaddr 72:1F:DF:D8:78:62
+```
+
+This is the `nvram:can not get wifi mac from nvram` path from §16 falling back
+to `get a random ether address`, which has been in every log since the driver
+first bound and was easy to ignore while nothing associated. It is not
+cosmetic now: a changing MAC breaks DHCP reservations, changes the connman
+service identity between boots, and defeats any MAC-based ACL on the AP.
+
+The vendor reads the MAC over msys from the modem's nvram, which we do not
+have. The options are a MAC derived from something stable on the board (the
+SoC chip id is readable), or one stored in the boot partition and passed in.
+Either way it should be settled before this is considered usable.
+
+Also worth knowing for bench work: the BSP shell has no `ping`.
