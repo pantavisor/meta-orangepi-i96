@@ -1508,3 +1508,73 @@ Two ways forward, and they answer different questions:
 (2) first is the better debugging order: if `iw dev wlan0 scan` does not
 return APs, the container would only add a layer of indirection over the same
 failure.
+
+---
+
+## 22. STAGE 4 COMPLETE — WPA2 association and DHCP (2026-07-28)
+
+§8's definition of done is met. The board associates with a WPA2 network and
+gets a DHCP lease.
+
+```
+*AO MayThe4thBeWithUs   wifi_6eabbfc22ceb_4d61795468653474684265576974685573_managed_psk
+
+wlan0  Link encap:Ethernet  HWaddr 6E:AB:BF:C2:2C:EB
+       inet addr:192.168.68.132  Bcast:192.168.68.255  Mask:255.255.255.0
+       inet6 addr: fe80::6cab:bfff:fec2:2ceb/64 Scope:Link
+       UP BROADCAST RUNNING MULTICAST  MTU:1500
+```
+
+`*AO` is connman for favourite / Associated / Online. Before that, the first
+successful scan on this board on mainline returned ten real APs, all under
+the station MAC the driver reported.
+
+### The tooling that made it reachable
+
+The BSP console shell has no `iw` and no `wpa_supplicant`, and
+`CONFIG_CFG80211_WEXT` is off so busybox's `iwlist`/`iwconfig` can never
+substitute. The tools live in the containers, reachable with:
+
+```
+pventer -c <container> [CMD ...]     # no CMD enters an interactive shell
+pventer -c os connmanctl technologies|scan wifi|services
+```
+
+Non-interactive `pventer -c os connmanctl <subcmd>` scripts cleanly over the
+serial console. Joining a network without an interactive agent is easiest
+through a connman config file:
+
+```
+pventer -c os sh -c 'printf "[service_home]\nType=wifi\nName=<SSID>\nPassphrase=<psk>\n" \
+    > /var/lib/connman/home.config'
+```
+
+connman picks it up and associates within a few seconds.
+
+Set `echo 0 > /sys/module/rdawfmac/parameters/wland_dbg_level` before any
+console work — at level 5 the trace floods the port and makes output
+unreadable.
+
+### Known limitation: WiFi does not survive a warm reboot
+
+After a soft reset — `reboot -f`, pantavisor's own reboot, or `reset` at the
+u-boot prompt — SDIO comes back as:
+
+```
+mmc1: error -110 whilst initialising SDIO card
+mmc1: Failed to initialize a non-removable card
+```
+
+Cold power-on works every time. The soft reset resets the SoC but **not** the
+RDA5991, which sits behind its own supply and is left mid-session with no
+clean re-initialisation, so `wland_combo`'s power-on tables run against a chip
+that is already "on" and in an unknown state.
+
+Worth noting the u-boot half of patch 32 is confirmed by the same test:
+`reset` at the `=>` prompt prints `resetting .` and comes back through the
+U-Boot banner into Linux.
+
+Likely fix, for the next session: drive a real off→on transition of the combo
+chip on init rather than assuming it is unpowered — the vendor sequence has a
+`wifi_power_off` that our probe path does not call first. §14 already
+exercised an OFF→ON transition by hand, so the pieces exist.
