@@ -1621,3 +1621,83 @@ SoC chip id is readable), or one stored in the boot partition and passed in.
 Either way it should be settled before this is considered usable.
 
 Also worth knowing for bench work: the BSP shell has no `ping`.
+
+---
+
+## 23. Next steps
+
+Stage 4 is functionally complete (§22): the board scans, associates with
+WPA2 and takes a DHCP lease. What follows is what stands between that and
+something shippable, in the order it is worth doing.
+
+### A. Blocking — WiFi is not yet usable unattended
+
+- [ ] **A1. Confirm why the association does not persist.** One command
+      answers it:
+      `pventer -c os ls -l /var/lib/connman/`
+      If `home.config` is gone, the container's writable layer is not
+      persisted and the network must be provisioned through pvwificonnect,
+      or the config placed somewhere pantavisor keeps. If it is still there,
+      the problem is connman not acting on it at boot and the logs in the
+      `os` container are the next place to look. **Unverified either way —
+      do not assume.**
+
+- [ ] **A2. Give the chip a stable MAC address.** It is currently random per
+      boot (§22 follow-up), which breaks DHCP reservations, connman service
+      identity and MAC ACLs. The vendor reads it over msys from modem nvram,
+      which a modemless boot does not have. Two workable sources: derive it
+      from the SoC chip id (`CHIP_ID` is readable — §10 saw `0x8810001c`),
+      or store one in the boot partition and pass it on the cmdline. Must be
+      stable across reboots and distinct per board.
+
+- [ ] **A3. Make WiFi survive a warm reboot.** Today any soft reset leaves
+      `mmc1: error -110 whilst initialising SDIO card` and no wlan0 until a
+      cold power cycle (§22). The soft reset does not reset the RDA5991.
+      Drive a real OFF→ON transition in the combo driver's init path rather
+      than assuming the chip is unpowered — the vendor sequence has
+      `wifi_power_off` and our probe never calls it first. §14's `wifi_power`
+      sysfs (`echo 0 > /sys/bus/i2c/devices/0-0016/wifi_power`) already
+      exercises both halves by hand, so this can be proven on the bench
+      before writing the patch.
+
+### B. Hardening and loose ends
+
+- [ ] **B1. Provision WiFi the product way.** `pvwificonnect` is built for
+      this machine but `pvwificonnect-client` was not found inside the
+      container — find out what that container actually exposes and use it,
+      rather than hand-written connman configs.
+- [ ] **B2. Kernel-side pinctrl.** The five AP pad registers still live in
+      u-boot (§15). Mainline has no RDA pinctrl driver; a DT pinctrl driver
+      is the correct home and removes the dependency on our bootloader.
+- [ ] **B3. Stop shipping stale bootloader blobs.** The `.rda` files under
+      `recipes-bsp/u-boot/files/rda8810-spl/` are build artifacts that went
+      stale and cost a flash cycle (§20). Either regenerate them in the build
+      (fix `package-bootloader.sh`, which wants the vendor `mkrdaimage.sh`
+      it does not need — the layout is plain concatenation) or drop them from
+      the tree.
+- [ ] **B4. Fix the `rtnl_is_locked()` guard in `wland_del_if()`.** It asks
+      "is anyone holding the RTNL", not "am I", so it is wrong under
+      concurrency. Teardown-only today, but it is the same class of bug as
+      §21 and will bite eventually.
+- [ ] **B5. Console baud.** 921600 is the outlier; the rest of pantavisor is
+      115200. Three places must change together — see §16. Deliberately
+      deferred while the level-5 trace was needed; that need has now passed.
+
+### C. Driver features deliberately not ported (§16)
+
+Only worth revisiting when something asks for them:
+
+- [ ] **C1. `mgmt_tx`** — needed for 802.11w MFP (SA Query), 802.11r FT, WNM.
+      Fine without it for WPA2-PSK on a full-MAC part.
+- [ ] **C2. Scheduled scan** — wpa_supplicant falls back to normal scans.
+- [ ] **C3. Averaged RSSI** — currently instantaneous; the averaging cache
+      lived in the `wland_iw.c` that was dropped.
+
+### D. Project
+
+- [ ] **D1. Extract to `pantacor/meta-orangepi-i96`.** The split was agreed
+      once WiFi worked; that condition is now met.
+- [ ] **D2. Upstream what can go upstream.** Patch 32
+      (`power: reset: rda8810pl`) is written against mainline style and
+      marked `Upstream-Status: Pending` — it is the one piece of this work
+      with a real path to mainline. The rdawlan driver is not.
