@@ -1394,3 +1394,72 @@ need checking:
   splits the byte stream and the log is unreadable. Kill by PID; do **not**
   `pkill -f "cat /dev/ttyUSB3"`, because the pattern matches the invoking
   shell's own command line and kills it.
+
+---
+
+## 21. `ifconfig wlan0 up` deadlocks on the RTNL (2026-07-28, patch 33)
+
+§20's hang is a self-deadlock, and the leading hypothesis there — a deaf
+interrupt path — was wrong. Both of the driver's waits
+(`dhd_os_ioctl_resp_wait()` and `dhd_os_wait_for_event()`) are
+`TASK_INTERRUPTIBLE` with a 5 s timeout, so a missing interrupt could never
+produce an unkillable task. That mismatch between symptom and mechanism is
+what pointed at a lock.
+
+```
+netdev_open()                      <- the net core calls ndo_open with RTNL held
+  wland_cfg80211_up()
+    wland_update_wiphybands(cfg, notify=true)
+      wiphy_apply_custom_regulatory()
+        rtnl_lock()                <- already ours. mutex, uninterruptible.
+```
+
+`wiphy_apply_custom_regulatory()` did not take the RTNL on the vendor's 3.10.
+On 6.6 it takes `rtnl_lock()` **and** `wiphy_lock()`
+(`net/wireless/reg.c`). Same call, new locking contract — invisible to the
+compiler, and it only fires when the interface is brought up, long after the
+rest of the port has been proven working.
+
+The whole driver contains exactly one other `rtnl_lock()`, in
+`wland_del_if()`, guarded by `rtnl_is_locked()` and only on teardown. That
+guard is itself sloppy — `rtnl_is_locked()` answers "is anyone holding it",
+not "am I" — but it is not on this path.
+
+### The fix
+
+Delete the re-application. It was redundant:
+
+- `wland_cfg80211_attach()` sets `wiphy->bands[NL80211_BAND_2GHZ] =
+  &__wl_band_2ghz`, sets `REGULATORY_CUSTOM_REG`, then calls
+  `wiphy_apply_custom_regulatory()` **before** `wiphy_register()` — the only
+  point mainline supports it, and with bands populated so
+  `handle_band_custom()` really runs.
+- `wland_regdom` is static, and the bands `wland_update_wiphybands()`
+  assigns are the *same* static structs. Their channel flags and power
+  limits are already in place from attach.
+
+The `notify` parameter existed only to gate that call, and both call sites
+passed a constant, so it goes too. A comment is left in its place.
+
+### Method note
+
+Three hypotheses were killed by reading rather than by another bench cycle,
+which matters when each cycle costs a build, a flash and a walk to the board:
+
+- **DT collision** — patch 32's new `system-controller@1a00000` node was the
+  obvious suspect for a regression that appeared in the same flash. Ruled
+  out by decompiling the DTB actually on the card: no overlap with `gpioc`
+  at `0x1a08000`, and nothing else claims the range.
+- **Patch 28 swallowing data-completion interrupts** — plausible, since
+  `mmc_wait_for_req()` *is* uninterruptible. Ruled out by reading the
+  handler: `mmc_signal_sdio_irq()` runs before the `mrq` checks and falls
+  through, and `rda_mmc_sdio_enable_irq()` is a read-modify-write that
+  preserves the other mask bits. The clincher was the log: transfers kept
+  working for 0.8 s after the IRQ was claimed, through the whole of
+  `preinit_cmds`.
+- **A deaf interrupt path** — ruled out by the timeouts above.
+
+Also worth correcting from §20: "the console stopped emitting kernel output"
+overstated the evidence. `wland_dbg_level` had just been set to 0, so the
+driver was muted by hand; the quiet console is largely explained by that, and
+does not by itself imply the stuck task held `console_lock`.

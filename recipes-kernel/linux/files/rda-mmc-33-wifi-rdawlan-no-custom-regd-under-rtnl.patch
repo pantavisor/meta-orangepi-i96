@@ -1,0 +1,91 @@
+From 51098dd9e38f9789bb90945748c13ae38984d8ac Mon Sep 17 00:00:00 2001
+From: Sergio Marin <sergio.marin@pantacor.com>
+Date: Thu, 30 Jul 2026 16:54:48 -0400
+Subject: [PATCH] wifi: rdawlan: don't re-apply custom regulatory from ndo_open
+
+`ifconfig wlan0 up` never returns. The task goes into uninterruptible sleep,
+SIGINT does nothing, and the RTNL stays held so every later network
+operation wedges behind it. Only a power cycle recovers the board.
+
+It is a self-deadlock on the RTNL:
+
+  netdev_open()                      <- net core calls this with RTNL held
+    wland_cfg80211_up()
+      wland_update_wiphybands(cfg, notify=true)
+        wiphy_apply_custom_regulatory()
+          rtnl_lock()                <- already ours; a mutex, uninterruptible
+
+wiphy_apply_custom_regulatory() did not take the RTNL in the 3.10 kernel this
+driver came from. On 6.6 it takes both rtnl_lock() and wiphy_lock() (see
+net/wireless/reg.c). Same call, new locking contract -- nothing the compiler
+could have flagged, and it only fires when the interface is brought up, well
+after everything else in the port has been proven working.
+
+The re-application was redundant anyway. wland_cfg80211_attach() already
+calls wiphy_apply_custom_regulatory() before wiphy_register(), which is the
+only point mainline supports it, and wland_regdom is static. The bands this
+function assigns are the same static __wl_band_* structs that
+handle_band_custom() walked at attach, so their channel flags and power
+limits are already applied.
+
+So drop the call. The `notify` parameter existed only to gate it and both
+call sites passed a constant, so it goes too, and a comment is left behind
+saying why this must not come back.
+
+Upstream-Status: Inappropriate [local forward-port of vendor driver]
+---
+ .../rdaw80211/rdawlan/wland_cfg80211.c        | 20 ++++++++++++++-----
+ 1 file changed, 15 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/net/wireless/rdaw80211/rdawlan/wland_cfg80211.c b/drivers/net/wireless/rdaw80211/rdawlan/wland_cfg80211.c
+index f8346b6..a9ea970 100644
+--- a/drivers/net/wireless/rdaw80211/rdawlan/wland_cfg80211.c
++++ b/drivers/net/wireless/rdaw80211/rdawlan/wland_cfg80211.c
+@@ -5324,7 +5324,7 @@ int cfg80211_reg_notifier(struct wiphy *wiphy,
+ 		goto exit;
+ 	}
+ 
+-	if ((ret = wland_update_wiphybands(cfg, false)) < 0)
++	if ((ret = wland_update_wiphybands(cfg)) < 0)
+ 		WLAND_ERR("wland_update_wiphybands failed\n");
+ exit:
+ #endif
+@@ -6231,7 +6231,7 @@ exit:
+ 	return err;
+ }
+ 
+-static s32 wland_update_wiphybands(struct wland_cfg80211_info *cfg, bool notify)
++static s32 wland_update_wiphybands(struct wland_cfg80211_info *cfg)
+ {
+ 	struct wland_if *ifp = netdev_priv(cfg_to_ndev(cfg));
+ 	struct wiphy *wiphy = cfg_to_wiphy(cfg);
+@@ -6336,8 +6336,18 @@ static s32 wland_update_wiphybands(struct wland_cfg80211_info *cfg, bool notify)
+ #ifdef WLAND_5GRF_SUPPORT
+ 	wiphy->bands[NL80211_BAND_5GHZ] = bands[NL80211_BAND_5GHZ];
+ #endif /*WLAND_5GRF_SUPPORT */
+-	if (notify)
+-		wiphy_apply_custom_regulatory(wiphy, &wland_regdom);
++
++	/*
++	 * The custom regulatory domain is applied once in wland_cfg80211_attach(),
++	 * before wiphy_register(), which is the only place mainline allows it.
++	 * Do NOT re-apply it here: wiphy_apply_custom_regulatory() takes rtnl_lock()
++	 * on this kernel, and the second caller of this function reaches it from
++	 * wland_cfg80211_up() -> netdev_open(), which the net core already invokes
++	 * with the RTNL held. That deadlocks the interface open, unkillably.
++	 *
++	 * Nothing is lost: wland_regdom is static, and the bands assigned above are
++	 * the same static structs handle_band_custom() already walked at attach.
++	 */
+ 
+ 	return err;
+ }
+@@ -6404,7 +6414,7 @@ s32 wland_cfg80211_up(struct net_device * ndev)
+ 	/*
+ 	 * according chip cap to update wiphybands
+ 	 */
+-	err = wland_update_wiphybands(cfg, true);
++	err = wland_update_wiphybands(cfg);
+ 	if (err)
+ 		goto up_exit;
+ 
