@@ -1463,3 +1463,48 @@ Also worth correcting from §20: "the console stopped emitting kernel output"
 overstated the evidence. `wland_dbg_level` had just been set to 0, so the
 driver was muted by hand; the quiet console is largely explained by that, and
 does not by itself imply the stuck task held `console_lock`.
+
+### Patch 33 confirmed on hardware (2026-07-28)
+
+`ifconfig wlan0 up` now returns, and the interface carries traffic:
+
+```
+[163.56] netdev_open: Enter, idx=0
+[163.57] wland_update_wiphybands: nmode=1, mimo_bw_cap=0
+[163.57] wland_cfg80211_up: Done(err:0)          <- used to hang here forever
+[163.57] netdev_open: netif_carrier_on(ndev)
+[163.57] netdev_open: netif_start_queue(ndev)
+[165.16] wland_netdev_start_xmit: skb->len=313
+[165.16] wland_sendpkt: dest 33:33:00:00:00:fb   <- IPv6 multicast, mDNS
+[165.17] wland_sdio_bus_txdata: TXDATA Wake up DPC work
+```
+
+`wland_cfg80211_up()` completes in 10 ms where it previously deadlocked, and
+the boot is otherwise unchanged: `WID Result Failed` 0, `FirmWareVer:0x10202`,
+`wland_bus_start Done(ret=0)`.
+
+So stage 4 now has: chip init, `wlan0` up, and TX flowing down the SDIO path.
+
+### What blocks the definition of done
+
+§8 wants WPA2 association plus DHCP, and that needs a supplicant. Neither is
+reachable from the BSP console today:
+
+- the shell has only `/sbin/ifconfig` and `/bin/busybox` — no `iw`, no
+  `wpa_supplicant`;
+- `CONFIG_CFG80211_WEXT` is **not set**, so busybox's `iwlist`/`iwconfig`
+  cannot substitute — they speak wireless extensions, and this driver is
+  nl80211-only by design (§16 dropped `wland_iw.c`).
+
+Two ways forward, and they answer different questions:
+
+1. **Deploy the `pvwificonnect` container** (already built as
+   `pvwificonnect-orangepi-i96.rootfs.ext4.gz`). This is the product path and
+   the way WiFi is meant to be provisioned on a pantavisor device.
+2. **Add `iw` to the BSP image** for bench work. Cheaper to iterate with, and
+   it isolates driver behaviour (scan results, association) from the
+   container plumbing — worth having while the driver is still unproven.
+
+(2) first is the better debugging order: if `iw dev wlan0 scan` does not
+return APs, the container would only add a layer of indirection over the same
+failure.
