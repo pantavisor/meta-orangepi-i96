@@ -1632,23 +1632,23 @@ something shippable, in the order it is worth doing.
 
 ### A. Blocking — WiFi is not yet usable unattended
 
-- [ ] **A1. Confirm why the association does not persist.** One command
-      answers it:
-      `pventer -c os ls -l /var/lib/connman/`
-      If `home.config` is gone, the container's writable layer is not
-      persisted and the network must be provisioned through pvwificonnect,
-      or the config placed somewhere pantavisor keeps. If it is still there,
-      the problem is connman not acting on it at boot and the logs in the
-      `os` container are the next place to look. **Unverified either way —
-      do not assume.**
+- [x] **A1. ~~Confirm why the association does not persist.~~ RESOLVED — it
+      does persist.** The premise was wrong: `/var/lib/connman` is a
+      dedicated persistent volume, `home.config` survived, and the board
+      re-associates unattended at every boot. The 169.254 sighting in §22 was
+      an observation made before association completed. See §24.
 
-- [ ] **A2. Give the chip a stable MAC address.** It is currently random per
-      boot (§22 follow-up), which breaks DHCP reservations, connman service
-      identity and MAC ACLs. The vendor reads it over msys from modem nvram,
-      which a modemless boot does not have. Two workable sources: derive it
-      from the SoC chip id (`CHIP_ID` is readable — §10 saw `0x8810001c`),
-      or store one in the boot partition and pass it on the cmdline. Must be
-      stable across reboots and distinct per board.
+- [ ] **A2. Give the chip a stable MAC address. BLOCKING.** §25 supersedes
+      §24 here: a device provisioned the **product way** (`pvwificonnect-cli`,
+      which writes only a MAC-keyed connman service) does **not** reconnect
+      after a reboot — verified on hardware. Only the SSID-keyed
+      `home.config` route is MAC-independent. It also leaks one
+      `wifi_<MAC>_…_managed_psk` directory per boot into `/var/lib/connman`,
+      and breaks DHCP reservations, connman service identity and MAC ACLs. The vendor reads it over msys from modem nvram, which a modemless
+      boot does not have. Two workable sources: derive it from the SoC chip id
+      (`CHIP_ID` is readable — §10 saw `0x8810001c`), or store one in the boot
+      partition and pass it on the cmdline. Must be stable across reboots and
+      distinct per board.
 
 - [ ] **A3. Make WiFi survive a warm reboot.** Today any soft reset leaves
       `mmc1: error -110 whilst initialising SDIO card` and no wlan0 until a
@@ -1662,10 +1662,13 @@ something shippable, in the order it is worth doing.
 
 ### B. Hardening and loose ends
 
-- [ ] **B1. Provision WiFi the product way.** `pvwificonnect` is built for
-      this machine but `pvwificonnect-client` was not found inside the
-      container — find out what that container actually exposes and use it,
-      rather than hand-written connman configs.
+- [ ] **B1. Provision WiFi the product way.** Blocked upstream, not by us.
+      The on-device tool is `pvwificonnect-cli` (`pvwificonnect-client` is a
+      *host-side BLE* tool and was never going to be in the container), and
+      it is present — but `connect` cannot work in v1.7.0. Three upstream
+      bugs, all confirmed by reading the shipped source; see §24. Until they
+      are fixed, `home.config` is the only working provisioning path on a
+      board with no Bluetooth.
 - [ ] **B2. Kernel-side pinctrl.** The five AP pad registers still live in
       u-boot (§15). Mainline has no RDA pinctrl driver; a DT pinctrl driver
       is the correct home and removes the dependency on our bootloader.
@@ -1701,3 +1704,223 @@ Only worth revisiting when something asks for them:
       (`power: reset: rda8810pl`) is written against mainline style and
       marked `Upstream-Status: Pending` — it is the one piece of this work
       with a real path to mainline. The rdawlan driver is not.
+
+---
+
+## 24. A1 answered: the association *does* persist (2026-08-03)
+
+Run on hardware over `/dev/ttyUSB3` at 921600. The board was already up when
+the session started, on a boot nobody had touched since §22.
+
+### The result
+
+`wlan0` was associated and routing, unattended, with no intervention:
+
+```
+wlan0  Link encap:Ethernet  HWaddr DA:83:07:A5:CC:9C
+       inet addr:192.168.68.142  Bcast:192.168.68.255  Mask:255.255.255.0
+       UP BROADCAST RUNNING MULTICAST  MTU:1500
+       RX packets:773  TX packets:375
+```
+
+The daemon log shows it happening at boot, 2m37s in:
+
+```
+Successfully retrieved saved networks: [MayThe4thBeWithUs]
+Waiting for wifi to be connected...
+Received signal: WiFi is connected.
+WiFi connection check result: connected=true
+WiFi is already connected, skipping AP startup
+```
+
+### Why §22 concluded the opposite
+
+`/var/lib/connman` is **a dedicated persistent volume**, not the container's
+writable layer:
+
+```
+/volumes/os/dockerovl--var-lib-connman on /var/lib/connman type overlay (rw,...)
+```
+
+`home.config` — the file hand-written in §22 — was still there, byte for
+byte. The §23 hypothesis ("the writable layer is not persisted") was wrong,
+and so was the plan built on it.
+
+What actually happened in §22 is that the check was made too early. The same
+false negative reproduced here: an `ifconfig wlan0` at ~2m00s uptime showed
+`BROADCAST MULTICAST` and no address; the association landed at 2m37s. §22's
+`169.254.224.21` was connman's link-local placeholder *during* association,
+not its fallback after failing to associate.
+
+**Method note, worth more than the result:** the doc committed to a diagnosis
+from one observation, wrote it up as two hypotheses, and put the wrong one
+first. It also recorded — correctly — that the board rebooted before the
+check could be repeated. That caveat was the honest part and it was ignored
+by the next reader. A single reading of an asynchronous system is a sample,
+not a measurement.
+
+### The MAC changes nothing about reconnection
+
+The prediction that a per-boot random MAC would break reconnection — via
+connman's `wifi_<MAC>_<ssid-hex>_<security>` service identity — was **wrong**.
+`home.config` is a connman *provisioning* file matched on `Name=` (the SSID);
+connman re-derives a MAC-keyed service from it on every boot. Reconnection is
+MAC-independent.
+
+What the changing MAC actually costs is visible in the same directory:
+
+```
+wifi_16e0a901118c_4d61795468653474684265576974685573_managed_psk
+wifi_6eabbfc22ceb_4d61795468653474684265576974685573_managed_psk
+wifi_721fdfd87862_4d61795468653474684265576974685573_managed_psk
+wifi_da8307a5cc9c_4d61795468653474684265576974685573_managed_psk
+```
+
+Four directories, one network, one per boot — unbounded growth, plus the
+DHCP/ACL/identity problems already in A2. Still worth fixing; not a blocker.
+
+### pvwificonnect v1.7.0 cannot provision from the CLI
+
+The intended test was to provision through pvwificonnect rather than by hand.
+That is not possible on this version. `scan`, `status` and `ap-status` all
+work — so the driver, connman and the D-Bus path are all fine — but `connect`
+fails after exactly 90 s:
+
+```
+dbus.go:164: ConnectWiFiNetwork: not proceeding — timed out after 1m30s waiting for Init to finish
+```
+
+Three defects, all read from the shipped source under
+`sysroots-components/cortexa5t2hf-neon/pvwificonnect-app/.../pvwificonnect/`:
+
+1. **`connect` can never succeed.** `ConnectWiFiNetwork` gates on
+   `waitForInit(90s)`, which blocks on the `initDone` channel closed only by
+   `signalInitDone()` in `Init()`. `Init()` has exactly one non-vendor caller:
+   `main.go:55`, in the **daemon**. `grep -rn "Init" cmd/pvwificonnect-cli/`
+   returns nothing — the CLI builds its own `ConnmanDbus` whose `initDone`
+   nothing will ever close. Deterministic 90 s timeout, on any board.
+2. **`connect --stored` lies.** `ConnectToStoredWiFiNetwork` is a stub:
+   `fmt.Println("not implemented ...")` then `return nil` — reports success
+   having done nothing.
+3. **The `network` block in `config.json` is dead.** `Network *WifiConf` is
+   declared in the config struct and documented in the upstream README, but
+   no non-vendor code reads it.
+
+Also inconsistent: the CLI's `stored` printed `No stored WiFi networks found`
+while the daemon's `SavedNetworks()` returned `[MayThe4thBeWithUs]` and the
+CLI's own `scan` showed that SSID as `SAVED true`.
+
+Consequence for this board: with no Bluetooth (`BLE: BlueZ is not available
+on D-Bus … BLE provisioning disabled`), the host-side BLE `pvwificonnect-client`
+is unavailable too, so the daemon's HTTP `/connections` endpoint and
+`home.config` are the only provisioning routes. Worth reporting upstream —
+none of it is i96-specific.
+
+### Two behaviours worth knowing on this driver
+
+- **Scanning drops the association.** Running `pvwificonnect-cli scan` while
+  connected produced `Watcher: confirmed disconnect (Connected=false, no
+  bound IP)`. The daemon's watcher recovered it 75 s later by toggling the
+  technology (`Watcher: WiFi reconnected successfully after 2 attempt(s)`).
+  The watcher works; scans are not free.
+- **The console shell reboots the board.** An idle shell prints `System will
+  reboot in 60 seconds`. `pvcontrol cmd defer-reboot 3600` holds it off, and
+  bench sessions need it before anything long-running.
+
+### Bench notes
+
+- Console is `/dev/ttyUSB3` at **921600**, `raw -echo clocal`; §18's
+  `stty` + background `cat` + `printf` method still works and is still
+  preferable to holding the port with picocom.
+- `wland_dbg_level=5` is on the boot cmdline; `echo 0 >
+  /sys/module/rdawfmac/parameters/wland_dbg_level` first or the port floods.
+- Lines much over ~70 characters get mangled on the way in — there is no
+  RTS/CTS. Keep commands short; long pipelines silently lose characters.
+- Containers are `os` (= alpine-connman), `pvwificonnect`, `pvr-sdk`,
+  `pv-avahi`, `pv-avahi-browse`, listed by `ls /pv/logs/current/`.
+- `pvr-sdk` has `curl` and `wget`; the `pvwificonnect` container has neither,
+  and the BSP shell has no `wc`, `ping` or `iw`.
+- The useful logs are `/pv/logs/current/pvwificonnect/lxc/console.log` (the
+  daemon's own output — this is what answered A1) and
+  `/pv/logs/current/os/pvwificonnect-dbus`.
+
+### Revised next steps
+
+A1 is closed. The blocking list is now A2 (stable MAC) and A3 (survive a warm
+reboot); A3 is the one that still makes the board need a human. **Do not
+`reboot` this board from a remote session** — §22's `-110` SDIO failure leaves
+no wlan0 until someone power-cycles it by hand.
+
+---
+
+## 25. The MAC *does* break reconnection — on the product path (2026-08-03)
+
+§24 said "The MAC changes nothing about reconnection". That is true only for
+the hand-written `home.config` route, and stating it unqualified was wrong.
+Tested on a freshly flashed card, provisioning through `pvwificonnect-cli`
+instead:
+
+1. Provisioned on boot A (MAC `F6:65:4E:BA:DE:CA`) — associated,
+   `192.168.68.143`, DHCP lease, traffic both ways.
+2. Cold power cycle. New MAC `DA:E1:85:93:66:33`.
+3. Boot B came up **unassociated** — `wlan0` UP but not RUNNING, no IPv4,
+   `TX 82 / RX 0` (probing, nothing joined).
+
+The stored profile survived on disk:
+
+```
+# pventer -c os ls /var/lib/connman/
+settings
+wifi_f6654ebadeca_4d61795468653474684265576974685573_managed_psk
+```
+
+…keyed to boot A's MAC, and **no `home.config`** — because the CLI does not
+write one. `GetStoredWiFiNetworks` walks connman's *current* services and
+filters on `Saved`, so an entry keyed to a MAC no interface has any more is
+invisible: `stored` reported "No stored WiFi networks found" while that
+directory sat on disk. Orphaned, not lost.
+
+So the two provisioning routes behave differently:
+
+| Route | What it writes | Survives a MAC change? |
+|---|---|---|
+| hand-written `home.config` | SSID-keyed *provisioning* file, re-applied by connman every boot | **Yes** (§24) |
+| `pvwificonnect-cli connect` | MAC-keyed connman *service* only | **No** |
+
+**A2 (stable MAC) is therefore a hard blocker for A1 on the product path**, not
+the cosmetic "one leaked directory per boot" §24 downgraded it to. A device
+provisioned the product way does not come back after a reboot.
+
+The `network` block in config.json (§24's upstream bug 4, now fixed) is the
+product-path equivalent of `home.config` — SSID-keyed and re-applied by `Init`
+each boot — so it is also the practical workaround until A2 is done.
+
+### Method note
+
+Both §24's over-correction and the original §22/§23 error came from the same
+habit: generalising from one provisioning route to "reconnection" as a whole.
+The mechanism (SSID-keyed provisioning file vs MAC-keyed service) was
+observable in `/var/lib/connman` the whole time; nobody looked at *which kind*
+of entry each route produced.
+
+### Bench note: never leave more than one reader on the port
+
+Four concurrent `cat /dev/ttyUSB3` readers had accumulated, silently splitting
+the byte stream — that is what turned `cat /pv/device-id` into `{wgevmce-id`
+and swallowed whole command results. Symptoms look like a flaky board. Check
+with `ps -eo pid,args | grep '[c]at /dev/ttyUSB3'` before believing any weird
+console output. Detached readers also do not reliably survive between tool
+invocations here; opening the port once per command, reader started *before*
+the write, is what works:
+
+```
+timeout N cat /dev/ttyUSB3 > out & sleep 0.4; printf 'CMD\r\n' > /dev/ttyUSB3; wait
+```
+
+Long-running device commands must be issued and captured inside a *single*
+window — output produced between two capture windows is simply lost.
+
+Also: `pvcontrol cmd defer-reboot 7200` silently does nothing (no confirmation
+line). `3600` works and echoes "shell timeout deferred to 3600 seconds". The
+console shell reboots the board on idle, and that reboot is warm, so it takes
+WiFi down until a cold power cycle (A3).
