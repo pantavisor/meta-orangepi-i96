@@ -1672,12 +1672,18 @@ something shippable, in the order it is worth doing.
 - [ ] **B2. Kernel-side pinctrl.** The five AP pad registers still live in
       u-boot (§15). Mainline has no RDA pinctrl driver; a DT pinctrl driver
       is the correct home and removes the dependency on our bootloader.
-- [ ] **B3. Stop shipping stale bootloader blobs.** The `.rda` files under
-      `recipes-bsp/u-boot/files/rda8810-spl/` are build artifacts that went
-      stale and cost a flash cycle (§20). Either regenerate them in the build
-      (fix `package-bootloader.sh`, which wants the vendor `mkrdaimage.sh`
-      it does not need — the layout is plain concatenation) or drop them from
-      the tree.
+- [x] **B3. ~~Stop shipping stale bootloader blobs.~~ DONE.** Both blobs were
+      confirmed stale — **0/5** pad constants each, `bootloader-hybrid.rda`
+      (tracked, Jun 20) and `bootloader-hybrid-debuguart.rda` (untracked,
+      Jul 22), against a pad map that landed Jul 24. The tracked one was
+      unreferenced by any recipe or script, so it is deleted;
+      `rda8810-spl/*.rda` is now gitignored, and `mk-sd-image.sh` documents
+      how to verify a blob and how to lift a known-good one out of a working
+      image. `u-boot-spl.bin` stays — it is the SPL half and is used by the
+      documented `build-rda8810-spl.sh` procedure.
+      Still open if the blob should be produced by the build rather than by
+      hand: `package-bootloader.sh` wants the vendor `mkrdaimage.sh` it does
+      not need, since the layout is plain concatenation.
 - [ ] **B4. Fix the `rtnl_is_locked()` guard in `wland_del_if()`.** It asks
       "is anyone holding the RTNL", not "am I", so it is wrong under
       concurrency. Teardown-only today, but it is the same class of bug as
