@@ -1650,15 +1650,12 @@ something shippable, in the order it is worth doing.
       partition and pass it on the cmdline. Must be stable across reboots and
       distinct per board.
 
-- [ ] **A3. Make WiFi survive a warm reboot.** Today any soft reset leaves
-      `mmc1: error -110 whilst initialising SDIO card` and no wlan0 until a
-      cold power cycle (§22). The soft reset does not reset the RDA5991.
-      Drive a real OFF→ON transition in the combo driver's init path rather
-      than assuming the chip is unpowered — the vendor sequence has
-      `wifi_power_off` and our probe never calls it first. §14's `wifi_power`
-      sysfs (`echo 0 > /sys/bus/i2c/devices/0-0016/wifi_power`) already
-      exercises both halves by hand, so this can be proven on the bench
-      before writing the patch.
+- [x] **A3. ~~Make WiFi survive a warm reboot.~~ DONE — patch 34 (§27).**
+      `rda_combo_clients_ready()` now calls `rda_wifi_power_off()` before
+      `rda_wifi_power_on()`, forcing a real OFF→ON instead of assuming the
+      chip is unpowered. Confirmed across two consecutive `reboot -f` with
+      no power cycle: `new SDIO card`, `wlan0` up and associated, zero
+      `error -110`. Cold boot unaffected.
 
 ### B. Hardening and loose ends
 
@@ -2009,3 +2006,89 @@ more reliable. Two caveats:
   capture makes pvr report "no debug shell"; check `fuser -v /dev/ttyUSB3`
   and kill by PID before suspecting the board. That same stale reader had
   been silently eating command output during earlier manual testing.
+
+---
+
+## 27. A3 SOLVED — WiFi survives a warm reboot (2026-08-04, patch 34)
+
+`reboot -f` no longer kills WiFi. The chip enumerates and associates without
+anyone touching the power.
+
+### The mechanism, and the control that proved it
+
+The RDA5991 sits behind its own supply and is not reset by an SoC soft reset.
+After a warm reboot the SoC restarts but the chip is left powered and
+mid-session, while probe treats it as cold and runs the power-on tables
+against that state. Every step reports success — the I2C slave answers
+throughout, which is exactly why this was mistaken for a marginal
+enumeration problem — but the chip never answers CMD5.
+
+Proven on the bench before the patch was written, on a board whose SDIO was
+already dead from a warm reboot. **Control first**, to rule out the rebind
+itself being the cure:
+
+```
+echo 20a60000.mmc > /sys/bus/platform/drivers/rda-mmc/unbind
+echo 20a60000.mmc > /sys/bus/platform/drivers/rda-mmc/bind
+  -> mmc1: Failed to initialize a non-removable card        (still dead)
+
+echo 0 > /sys/bus/i2c/devices/0-0016/wifi_power
+echo 1 > /sys/bus/i2c/devices/0-0016/wifi_power
+  -> rda_5991g_wifi_power_off succeed!!
+  -> rda_5991g_wifi_power_on write control_mode_disable succeed!!
+<same rebind>
+  -> mmc1: new SDIO card at address 4829                    (recovered)
+```
+
+`wlan0` did **not** return in that hand-driven case, because rdawlan has
+already unregistered itself by ~12.6 s (§18). That is not a failure of the
+hypothesis — it is why the transition has to happen at init, while the
+driver is still present to bind the card.
+
+### The patch
+
+Patch 34 adds `rda_wifi_power_off()` ahead of `rda_wifi_power_on()` in
+`rda_combo_clients_ready()`.
+
+**No settle delay**, deliberately. The bench proof happened to have seconds
+between the two halves (two separate shell commands), so a delay was the
+tempting thing to add. Instead the vendor's own idiom decided it:
+`rda_5990_wifi_power_on()` pairs `power_off()` with an immediate `goto
+_retry` and no delay. Following the vendor sequence beats inventing a
+timeout — see [[rda8810-apbi-reset-poison]] for the other direction of the
+same lesson. Two boots confirm no delay is needed; had one been added
+blindly it would have looked equally "working" while hiding whether it
+mattered.
+
+### Confirmed on hardware
+
+Cold boot, unchanged (the off half is a no-op on an already-off chip):
+
+```
+[   1.000000] rda_5991g_wifi_power_off succeed!!
+[   2.440000] mmc1: new SDIO card at address 4829
+```
+
+Then two consecutive `reboot -f`, no power cycle at any point:
+
+```
+[   0.990000] rda_5991g_wifi_power_off succeed!!
+[   2.380000] mmc1: new SDIO card at address 4829
+lo  lxcbr0  sit0  wlan0
+wlan0  inet addr:192.168.68.147
+```
+
+`dmesg | grep -c 'error -110|Failed to initialize'` → **0** on both.
+
+The second reboot was run specifically because this failure had looked
+intermittent before; one green boot would not have settled it.
+
+### Consequence for the rest of the list
+
+A3 was the item that made the board need a human. With it closed, **A2
+(stable MAC) is the only remaining blocker** — and note the two interact:
+patch 32 made `reboot` work, patch 34 makes WiFi survive it, but a
+CLI-provisioned network still will not rejoin afterwards because its ConnMan
+service is keyed to the previous boot's MAC (§25). Unattended operation
+needs A2, or the config.json `network` block (B1) as the SSID-keyed
+workaround.
