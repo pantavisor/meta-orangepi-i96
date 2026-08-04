@@ -69,6 +69,7 @@ SRC_URI:append:orangepi-i96 = " \
     file://rda-mmc-30-wifi-rdawlan-debug-module-params.patch \
     file://rda-mmc-31-wifi-rdawlan-claim-sdio-irq-when-leaving-poll.patch \
     file://rda-mmc-33-wifi-rdawlan-no-custom-regd-under-rtnl.patch \
+    file://rda-mmc-34-wifi-combo-force-off-on-at-init.patch \
 "
 
 # Machine restart and power-off. Unrelated to WiFi, but the WiFi bring-up is

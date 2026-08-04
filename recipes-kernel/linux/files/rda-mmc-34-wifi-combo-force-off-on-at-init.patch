@@ -1,0 +1,75 @@
+From: Sergio Marin <sergio.marin@pantacor.com>
+Subject: [PATCH] wifi: rda_combo: force an OFF->ON transition at init
+
+The RDA5991 sits behind its own supply and is not reset by an SoC soft
+reset. After a warm reboot -- `reboot -f`, pantavisor's own reboot, or
+`reset` at the u-boot prompt -- the SoC restarts but the combo chip is left
+powered and mid-session, while probe assumes it is cold and runs the
+power-on tables against that state. The chip then answers I2C, so the
+version read and the whole power-on sequence report success, but it never
+answers CMD5:
+
+  mmc1: error -110 whilst initialising SDIO card
+  mmc1: Failed to initialize a non-removable card
+
+and there is no wlan0 until someone physically power-cycles the board. Cold
+boots always worked, which made this look like a marginal enumeration
+problem rather than stale chip state.
+
+Drive a real OFF->ON transition instead: call rda_wifi_power_off() before
+rda_wifi_power_on(). On a cold boot the off half is a no-op against an
+already-off chip; after a warm reboot it is what puts the chip back into a
+state the power-on tables can act on. Pairing the two with no settle delay
+matches the vendor's own idiom -- rda_5990_wifi_power_on() does exactly this
+on its internal retry path (power_off() then goto _retry).
+
+Confirmed on hardware (Orange Pi i96), with a control to isolate the cause.
+After a warm reboot that had left mmc1 dead, rebinding the MMC host on its
+own reproduced the failure:
+
+  echo 20a60000.mmc > /sys/bus/platform/drivers/rda-mmc/unbind
+  echo 20a60000.mmc > /sys/bus/platform/drivers/rda-mmc/bind
+  -> mmc1: Failed to initialize a non-removable card
+
+while an OFF->ON through the wifi_power sysfs attribute, followed by the
+same rebind, enumerated the card:
+
+  echo 0 > /sys/bus/i2c/devices/0-0016/wifi_power
+  echo 1 > /sys/bus/i2c/devices/0-0016/wifi_power
+  -> rda_5991g_wifi_power_off succeed!!
+  -> rda_5991g_wifi_power_on write control_mode_disable succeed!!
+  <rebind>
+  -> mmc1: new SDIO card at address 4829
+
+wlan0 does not return in that hand-driven case because rdawlan has already
+unregistered itself by then (wlanfmac_module_init gives up at ~12.6s). The
+driver has to be present when the card enumerates, which is why the
+transition belongs at init rather than in a recovery path.
+
+Upstream-Status: Inappropriate [vendor driver, not upstream]
+Signed-off-by: Sergio Marin <sergio.marin@pantacor.com>
+---
+--- a/drivers/net/wireless/rdaw80211/rdacombodev/rda_combo_power_main.c
++++ b/drivers/net/wireless/rdaw80211/rdacombodev/rda_combo_power_main.c
+@@ -380,6 +380,21 @@ static void rda_combo_clients_ready(struct device *dev)
+ 		return;
+ 	}
+ 
++	/*
++	 * Force a real OFF->ON transition rather than assuming the chip is
++	 * unpowered. The RDA5991 has its own supply and is not reset by an
++	 * SoC soft reset, so after a warm reboot it is still powered and
++	 * mid-session while we are about to treat it as cold. Running the
++	 * power-on tables against that state leaves the chip answering I2C
++	 * but never CMD5 (mmc1: error -110) until a physical power cycle.
++	 *
++	 * The off half is harmless against a genuinely cold chip. Pairing it
++	 * with an immediate power-on and no settle delay matches the vendor's
++	 * own retry idiom in rda_5990_wifi_power_on().
++	 */
++	if (rda_wifi_power_off())
++		dev_dbg(dev, "wifi pre-init power off reported an error\n");
++
+ 	/*
+ 	 * Bring-up aid: power the WLAN side on right away so the SDIO
+ 	 * function enumerates. TODO: move under rfkill / the wlan driver's
