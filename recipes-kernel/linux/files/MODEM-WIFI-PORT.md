@@ -1662,13 +1662,21 @@ something shippable, in the order it is worth doing.
 
 ### B. Hardening and loose ends
 
-- [ ] **B1. Provision WiFi the product way.** Blocked upstream, not by us.
-      The on-device tool is `pvwificonnect-cli` (`pvwificonnect-client` is a
-      *host-side BLE* tool and was never going to be in the container), and
-      it is present — but `connect` cannot work in v1.7.0. Three upstream
-      bugs, all confirmed by reading the shipped source; see §24. Until they
-      are fixed, `home.config` is the only working provisioning path on a
-      board with no Bluetooth.
+- [x] **B1. ~~Provision WiFi the product way.~~ MOSTLY DONE — fixed upstream
+      and verified here (§26).** The on-device tool is `pvwificonnect-cli`
+      (`pvwificonnect-client` is a *host-side BLE* tool and was never going to
+      be in the container). Its three §24 defects are fixed in pvwificonnect
+      **v1.8.0**, which this layer now builds; `connect`, `stored` and
+      `connect --stored` were all confirmed on hardware. `home.config` is no
+      longer the only route.
+      **Remaining:** the `network` block in config.json (the fourth fix) is
+      shipped but never exercised — testing it needs the SSID/passphrase in
+      `pvwificonnect/pvwificonnect-config/var/pvwificonnect/config.json`
+      plus a rebuild, since `/var/pvwificonnect` in the container is on the
+      ephemeral LXC overlay upper, not a persistent volume. It matters more
+      than a loose end: it is SSID-keyed and replayed on every `Init`, so it
+      is what makes provisioning survive the per-boot random MAC (§25) — i.e.
+      the practical workaround for A2.
 - [ ] **B2. Kernel-side pinctrl.** The five AP pad registers still live in
       u-boot (§15). Mainline has no RDA pinctrl driver; a DT pinctrl driver
       is the correct home and removes the dependency on our bootloader.
@@ -1691,6 +1699,11 @@ something shippable, in the order it is worth doing.
 - [ ] **B5. Console baud.** 921600 is the outlier; the rest of pantavisor is
       115200. Three places must change together — see §16. Deliberately
       deferred while the level-5 trace was needed; that need has now passed.
+      No longer blocks tooling: `pvr device tty` hardcoded 115200 and so
+      reported "no debug shell" on this board, making every tty subcommand
+      unusable; it now takes `-b/--baud`, so
+      `pvr device tty -d /dev/ttyUSB3 -b 921600 run "CMD"` works (§26).
+      Still worth doing for consistency with every other pantavisor board.
 
 ### C. Driver features deliberately not ported (§16)
 
@@ -1930,3 +1943,69 @@ Also: `pvcontrol cmd defer-reboot 7200` silently does nothing (no confirmation
 line). `3600` works and echoes "shell timeout deferred to 3600 seconds". The
 console shell reboots the board on idle, and that reboot is warm, so it takes
 WiFi down until a cold power cycle (A3).
+
+---
+
+## 26. pvwificonnect v1.8.0 verified; bench tooling fixed (2026-08-04)
+
+### The upstream fixes shipped and were confirmed on hardware
+
+§24's three defects (plus a fourth found while fixing them) are released as
+pvwificonnect **v1.8.0**, and this layer now builds it — recipes renamed to
+`*_v1.8.0.bb`, `src` `0582c32b…`, `vendor` `cc1ec806…`.
+
+Fixed:
+
+1. `ConnectWiFiNetwork` gated on `waitForInit`, whose `initDone` channel is
+   closed only by `Init()` — called solely from the daemon's `main.go`. A CLI
+   process therefore always burned the full 90 s timeout. `SetStandalone()`
+   releases the gate for processes that never run `Init`.
+2. `ConnectToStoredWiFiNetwork` was a stub printing "not implemented" and
+   returning nil, i.e. reporting success. Now resolves the service from a
+   warmed `netCache`, verifies the SSID is a favourite, and errors otherwise.
+3. `GetStoredWiFiNetworks` built its list then `return nil, nil`.
+4. The `network` block in config.json was declared and documented but read by
+   nothing; `Init` now joins it before falling back to the AP.
+
+Verified on a cold-booted board (MAC `42:4C:78:07:02:34`) running an image
+built from the **published** tarballs, dev overlay disabled:
+
+```
+stored (fresh card)              -> No stored WiFi networks found.      baseline
+connect -s … -p …                -> Successfully connected; 192.168.68.146   (1)
+stored                           -> Stored WiFi networks: 1. MayThe4th…      (3)
+connect -s NoSuchNet --stored    -> Error: no stored network named "NoSuchNet" (2)
+connect -s MayThe4th… --stored   -> Successfully connected                   (2)
+```
+
+Before flashing, the arm32 binary was extracted from the image's own squashfs
+object (via `/trails/0/.pvr/json` → `/objects/<sha256>` → `unsquashfs`) and
+checked for the new strings — the code that boots, not the build log.
+
+**Fix 4 is still unexercised**, and it is the one that matters most here: see
+B1.
+
+### `pvr device tty` now takes `-b/--baud`
+
+The serial speed was hardcoded to 115200 in three places (the `serialProbe`
+termios, the `stty` call in `interactive`, and the connect banner), so this
+board at 921600 reported `no Pantavisor debug shell` — indistinguishable from
+a board that is off or hung — and every tty subcommand was unusable against
+it. Added in pvr `feat(device): add --baud flag to device tty`. Default stays
+115200, unsupported rates are rejected up front with the valid list.
+
+```
+pvr device tty -d /dev/ttyUSB3 -b 921600 run "CMD"
+```
+
+This replaces the manual `stty`/`cat`/`printf` dance in §18/§25 and is much
+more reliable. Two caveats:
+
+- `runCommands` has a **10 s per-command deadline**. Anything slower (any
+  `pvwificonnect-cli connect`/`stored`) prints "timeout waiting for response"
+  yet still completes on the device. Robust pattern: redirect on the device
+  (`… >/tmp/x.log 2>&1`) and grep the log in a second call.
+- Only one process may hold the port. A stale `cat` left over from manual
+  capture makes pvr report "no debug shell"; check `fuser -v /dev/ttyUSB3`
+  and kill by PID before suspecting the board. That same stale reader had
+  been silently eating command output during earlier manual testing.
