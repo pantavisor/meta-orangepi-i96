@@ -2417,3 +2417,49 @@ board:
 `pvwificonnect-cli improv-serial` needs no Bluetooth and is already on the
 device. Untested. It would contend with the debug console on uart3 unless one
 of the free UARTs is used.
+
+### CONFIRMED on the vendor system: BT does not answer there either
+
+Run on the vendor Debian 3.10 SD card (login `orangepi`/`orangepi`), i.e. the
+vendor's own kernel, own tools, and **with the modem running** (their u-boot
+does `mdcom_loadm`):
+
+```
+$ sudo hciattach /dev/ttyS1 any
+Device setup complete
+Bluetooth: hci0 command 0x1003 tx timeout      # Read_Local_Supported_Features
+Bluetooth: hci0 command 0x1001 tx timeout      # Read_Local_Version_Information
+Bluetooth: hci0 command 0x1009 tx timeout      # Read_BD_ADDR
+```
+
+`Device setup complete` means the attach worked and the line discipline bound —
+the UART is real. Every HCI command then times out: the controller is silent.
+
+Their `ttyS1` is hardware UART1, the same UART as our `/dev/ttyRDA1`, so this
+is the identical failure we see (§30), reproduced on the vendor's own software.
+**Our port has reached parity with the vendor; Bluetooth is not a gap in the
+port.**
+
+Supporting evidence that nobody ships BT for this board:
+- The vendor image has the full stack (Bluetooth core 2.16, HCI UART 2.2, H4),
+  `hciattach`, `btattach` and `/etc/init.d/bluetooth` — and still boots with an
+  empty `/sys/class/bluetooth`.
+- OrangePi's own sources (`github.com/orangepi-xunlong`, `OrangePiRDA_external`
+  and `OrangePiRDA_scripts`) contain **no Bluetooth bring-up at all** — no
+  hciattach invocation, no init, no firmware. Their `sbin/` covers camera,
+  GPIO, GSM, PPP and audio only.
+- The product page does advertise it ("Onboard WiFi+BT RDA5991"), so the
+  silicon has BT. Nobody's Linux software turns it on.
+
+**Conclusion.** Making BLE work here is not "finish the port" — it is making
+Bluetooth work where the vendor never did. RDA8810PL is an Android phone SoC,
+so a functioning BT path most likely needs an Android-BSP-style stack
+(proprietary HAL, firmware download, vendor-specific init) that does not exist
+in any Linux image for this board. Possibly the controller is also not reachable
+from the AP at all — consistent with the vendor's own comment that the
+remaining UART is "for host interface, AP never use".
+
+**Recommendation: use `pvwificonnect-cli improv-serial`** for Improv
+provisioning. It needs no Bluetooth, is already on the device, and delivers the
+actual goal. Keep patch 38 and the BT kernel config: they are correct, cost
+nothing, and mean the stack is ready if a BT path is ever found.
