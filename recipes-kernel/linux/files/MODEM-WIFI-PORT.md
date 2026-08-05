@@ -2214,3 +2214,75 @@ gap is `CONFIG_BT` plus an HCI transport for the RDA5991's BT half; userspace
 is waiting for it. `pvwificonnect-cli improv-serial` needs no Bluetooth at
 all and is present today, though untested and it would contend with the
 debug console.
+
+---
+
+## 29. NEXT: Bluetooth / BLE provisioning — scoping (2026-08-05)
+
+Not started. This section exists so the work can begin without re-deriving
+what is already known. Everything below was measured on hardware unless
+marked otherwise.
+
+### What already exists
+
+- **BlueZ is shipped and running.** `/usr/lib/bluetooth/bluetoothd` in the
+  `os` (alpine-connman) container, enabled in the default runlevel, pid alive.
+  It never claims `org.bluez` on the system bus — verified with
+  `dbus-send --system --dest=org.freedesktop.DBus … ListNames`, zero matches —
+  because there is no adapter to register. Userspace is waiting for hardware.
+- **The combo driver already powers the BT side.** `rda_5991g_bt_power_on()` /
+  `_off()` and the per-chip variants are ported (patch 17). Nothing calls them
+  yet: `rda_combo_clients_ready()` only brings up WLAN.
+- **The BT control clients are already in DT.** `bt_core: bluetooth@15` and
+  `bt_rf: bluetooth@16` on i2c0, alongside the WiFi pair at 0x13/0x14.
+- **pvwificonnect ships a BLE/Improv server** that auto-detects and disables
+  itself: `BLE: BlueZ is not available on D-Bus … BLE provisioning disabled`.
+  It should light up on its own once an adapter appears.
+
+### What is missing
+
+1. **`CONFIG_BT` and the HCI stack** — unset today. No `/sys/class/bluetooth`,
+   and `/proc/net/protocols` lists zero BT protocols. Needs at minimum
+   `CONFIG_BT`, `CONFIG_BT_BREDR`/`CONFIG_BT_LE`, and a transport
+   (`CONFIG_BT_HCIUART` + a protocol such as H4/LL) in `rda8810pl.cfg`.
+2. **An HCI transport driver / binding for the RDA5991 BT half.** Only
+   `rdawlan` was ported. Nothing in tree speaks HCI to this chip.
+3. **Which UART the BT half is on — UNKNOWN, and the first thing to settle.**
+   Facts: the board has three UARTs, all enabled in the DTS, with aliases
+   `serial0 = &uart2` (@0x10000), `serial1 = &uart1` (@0),
+   `serial2 = &uart3` (@0x90000). **`serial2`/uart3 is the debug console**
+   (`stdout-path = "serial2:921600n8"`, `console=ttyRDA2`). So uart1 and uart2
+   are the candidates. Confirm against the schematic
+   (96boards docs repo, `orangepi_i96_v1_2-print.pdf`) and the vendor
+   `tgt_ap_board_config.h` before writing any DT.
+4. **Pinmux, almost certainly.** Every previous peripheral on this board needed
+   pads switching out of GPIO mode — I2C1 (§10), SDMMC2 (§15, five registers).
+   Assume the BT UART pads need the same treatment in
+   `rda_combo_pinmux()` and check `BB_GPIO_Mode`/`AP_GPIO_*_Mode` against a
+   running vendor system before assuming otherwise. §15's method — dump the
+   pad registers from the working vendor image and diff — is what cracked SDIO
+   and would likely crack this too.
+
+### Suggested order
+
+1. Identify the BT UART from the schematic and the vendor board config.
+2. Enable `CONFIG_BT` + `CONFIG_BT_HCIUART` and confirm `/sys/class/bluetooth`
+   appears and `bluetoothd` claims `org.bluez` (it will still have no adapter).
+3. Call `rda_bt_power_on()` from the combo driver, and check the BT side
+   answers at all.
+4. Attach the UART as HCI (`btattach`, or a serdev binding in DT) and look for
+   `hci0`.
+5. Only then expect `pvwificonnect`'s BLE server to enable itself.
+
+### Cheaper alternative, if BLE is not specifically required
+
+`pvwificonnect-cli improv-serial` implements the Improv Wi-Fi **serial**
+protocol and is already on the device — no Bluetooth involved. Untested here,
+and it would contend with the debug console on uart3 unless one of the free
+UARTs is muxed for it. Worth 20 minutes before committing to the BT stack.
+
+### Do not repeat
+
+`pvwificonnect-client` (the host-side tool) is **BLE-only** and needs BlueZ on
+the *host*; it is unrelated to whether the device has Bluetooth. That naming
+already cost one dead end (§24).
