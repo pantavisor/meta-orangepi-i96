@@ -2562,3 +2562,67 @@ section 30 reached for Bluetooth.
 
 **Patch 39 is worth keeping regardless:** the AP software path is correct now,
 so if a mode WID is ever found, only that one piece is missing.
+
+### CONFIRMED: AP does not work on the VENDOR system either
+
+Tested directly on the vendor Debian 9 / kernel 3.10 SD card (orangepi/orangepi),
+i.e. vendor kernel + vendor driver + vendor userland (NetworkManager, dnsmasq,
+wpa_supplicant — not ConnMan), with the modem running.
+
+```
+$ sudo nmcli d wifi hotspot
+[RDAWLAN_ERR]:<cfg80211_del_station,4641>: mac addr is NULL ignore it
+Device 'wlan0' successfully activated with '8f44e60f-...'
+$ nmcli d
+wlan0   wifi   connected   Hotspot
+$ cat /sys/class/net/wlan0/operstate
+up
+$ nmcli -f 802-11-wireless.ssid c show Hotspot
+802-11-wireless.ssid:   Hotspot-orangepii96
+```
+
+NetworkManager reports the AP active, the interface is up, and the driver's AP
+path demonstrably ran (`cfg80211_del_station` fired). **No beacon reaches the
+air.** A scan from the known-good RPi3 (`/dev/ttyUSB2`) returned 13 neighbouring
+SSIDs and no `Hotspot-orangepii96`, repeated across two scans.
+
+Station mode on that same vendor system works fine — it was associated with
+`MayThe4thBeWithUs` before the hotspot was started. So the radio transmits; it
+just never beacons.
+
+**=> AP/softap is NOT a gap in our port. We have parity with the vendor**, the
+same conclusion section 30 reached for Bluetooth. This was worth testing
+precisely because the source comparison (below) had already proven the two
+drivers identical on every AP-relevant line, which made the vendor result
+decisive rather than merely suggestive.
+
+#### Source comparison: our driver vs the vendor's, after patch 39
+
+Fetched from `OrangePiLibra/OrangePi_i96_kernel@master`,
+`drivers/net/wireless/rdaw80211/rdawlan/`:
+
+| | vendor | ours (patch 39) |
+|---|---|---|
+| `.start_ap` / `.stop_ap` / `.change_beacon` / `.del_station` | present | present |
+| `BIT(NL80211_IFTYPE_AP)` in `interface_modes` | present | present |
+| `change_virtual_iface` AP branch | sets a bit, sends chip nothing | identical |
+| `start_ap_set` WIDs | same 8, no mode, no channel | identical |
+| `wland_fil_iovar_data_{set,get}` | `#if 0`, returns 0 | identical |
+
+So the stubbed iovar layer and the missing mode/channel WID are **the vendor's
+own design**, not forward-port damage. Patch 39 restored exactly the vendor's
+configuration — and the vendor's configuration does not beacon.
+
+Do not spend more time treating softap as a porting problem. Use
+`pvwificonnect-cli improv-serial` for first-boot provisioning.
+
+#### Side confirmation of section 28 (MAC stability)
+
+The vendor's own boot log shows:
+```
+[4.666015] wlan_read_mac_from_nvram: nvram:get invalid wifi mac address from nvram
+[4.667175] wland_bus_start: nvram:get a random ether address
+```
+The vendor board also has no valid NVRAM MAC and falls back to a random address
+every boot. Patch 37's CID derivation fixes a real vendor defect, not a porting
+artifact.
