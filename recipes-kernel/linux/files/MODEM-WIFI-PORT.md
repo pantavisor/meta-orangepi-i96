@@ -2247,7 +2247,7 @@ marked otherwise.
    (`CONFIG_BT_HCIUART` + a protocol such as H4/LL) in `rda8810pl.cfg`.
 2. **An HCI transport driver / binding for the RDA5991 BT half.** Only
    `rdawlan` was ported. Nothing in tree speaks HCI to this chip.
-3. **Which UART the BT half is on — UNKNOWN, and the first thing to settle.**
+3. **Which UART the BT half is on — LIKELY uart1, see below.**
    Facts: the board has three UARTs, all enabled in the DTS, with aliases
    `serial0 = &uart2` (@0x10000), `serial1 = &uart1` (@0),
    `serial2 = &uart3` (@0x90000). **`serial2`/uart3 is the debug console**
@@ -2262,6 +2262,51 @@ marked otherwise.
    running vendor system before assuming otherwise. §15's method — dump the
    pad registers from the working vendor image and diff — is what cracked SDIO
    and would likely crack this too.
+
+### Vendor evidence (2026-08-05) — transport and UART identified
+
+Fetched from `OrangePiLibra/OrangePi_i96_kernel@master`. This answers most of
+unknown #1.
+
+**Transport: generic `hci_uart` with H4. There is no RDA BT driver.**
+`drivers/bluetooth/` in the vendor tree contains nothing RDA-specific, and the
+vendor's own `.config` has:
+
+```
+CONFIG_BT=y            CONFIG_BT_HCIUART=y      CONFIG_BT_HCIUART_H4=y
+CONFIG_BT_RFCOMM=y     CONFIG_BT_BNEP=y         CONFIG_BT_HIDP=y
+CONFIG_BT_RANDADDR=y
+```
+
+All mainline except `CONFIG_BT_RANDADDR`, which is a vendor addition — likely
+BD-address randomisation, i.e. the same class of problem as the WiFi MAC (§28).
+Expect the BD address to need the same treatment; do not assume it is stable.
+
+**UART mapping, from `arch/arm/mach-rda/devices.c`:**
+
+```
+ * use UART3 as default console
+ * use UART1 as uart2
+ * UART2 is for host interface, AP never use
+```
+
+- **UART3** = console. Matches ours exactly (`serial2 = &uart3`, ttyRDA2).
+- **UART2** = modem/host interface. Not ours to use.
+- **UART1** = the only remaining general-purpose UART, and the vendor registers
+  it with **`.wakeup = 1`** — the giveaway for a BT UART.
+
+Corroborating: `include/rda/tgt_ap_gpio_setting.h` defines
+**`_TGT_AP_GPIO_BT_HOST_WAKE  GPIO_B1`**, so BT host-wake is wired on this
+board.
+
+**So the leading candidate is our `uart1` (@0x0, `serial1`, ttyRDA1)** — it is
+already `status = "okay"` in the i96 board DTS. Strong inference, not proof:
+the vendor never names a BT UART outright, so confirm against the schematic or
+by attaching and seeing whether the chip answers.
+
+The same file confirms this is the right board config — its SDMMC2 values
+(`MAX_FREQ 20000000`, `MCLK_INV 1`, `MCLK_ADJ 3`) are exactly what §15 landed
+on independently.
 
 ### Suggested order
 
