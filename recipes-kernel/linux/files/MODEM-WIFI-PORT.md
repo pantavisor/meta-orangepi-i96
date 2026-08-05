@@ -2463,3 +2463,102 @@ remaining UART is "for host interface, AP never use".
 provisioning. It needs no Bluetooth, is already on the device, and delivers the
 actual goal. Keep patch 38 and the BT kernel config: they are correct, cost
 nothing, and mean the stack is ready if a BT path is ever found.
+
+---
+
+## 31. AP mode (softap / captive portal): software path fixed, chip does not beacon
+
+**Status: NOT WORKING.** Patch 39 makes every software layer succeed, but no
+beacon reaches the air. This is a *firmware/driver* limitation, not a
+configuration problem, and it is not something patch 39 can finish.
+
+### What patch 39 fixed (keep it)
+
+The 6.6 forward-port had stripped AP support out of `wland_cfg80211.c`. Patch 39
+restores it:
+
+- `.start_ap`, `.stop_ap`, `.change_beacon`, `.del_station` in `cfg80211_ops`
+- `BIT(NL80211_IFTYPE_AP)` in `wiphy->interface_modes`
+
+Signature updates needed for 6.6: `stop_ap` gained a trailing
+`unsigned int link_id`; `del_station` now takes
+`struct cfg80211_del_sta_params *params` (use `params->mac`).
+
+**Both halves are required.** The ops alone are not enough — without the
+`interface_modes` bit, `nl80211` rejects the mode change before the ops are ever
+called. Note the *interface-combinations* table (`wland_iface_limits`) still
+lists AP; that table is inside `#ifdef WLAND_TBD_SUPPORT` and is NOT the one
+that matters. Do not read it as "AP is already advertised" — that cost a wrong
+diagnosis once.
+
+### What now works, verified on hardware
+
+- `pvwificonnect-cli ap-status` -> "Access point is active."
+- ConnMan: `Tethering = True`, `TetheringIdentifier` set, `TetheringFreq = 2412`
+- `iw dev wlan0 info` -> `type AP`, `ssid <name>`
+- dmesg: `tether: port 1(wlan0) entered forwarding state`, wlan0 into
+  allmulticast + promiscuous
+
+### What does not work
+
+**No beacon is transmitted.** Verified two independent ways: a scan from a
+known-good RPi3 (`/dev/ttyUSB2`) sees 21 SSIDs including `MayThe4thBeWithUs` but
+not the i96's; and the SSID never appears on a phone.
+
+### Root cause found: the chip is never told to become an AP
+
+`wland_cfg80211_change_virtual_iface()` handles the STA->AP transition. Compare
+the two branches:
+
+- **station**: calls `wland_fil_iovar_data_set(ifp, "set_infra", ...)`
+- **AP**: does nothing but `set_bit(VIF_STATUS_AP_CREATING, &vif->sme_state)`
+  plus a debug print. **Nothing is sent to the chip.**
+
+And it would not matter anyway, because **the entire iovar layer is compiled
+out**: both `wland_fil_iovar_data_set()` and `wland_fil_iovar_data_get()`
+(`wland_cmds.c` ~line 429) have their whole body inside `#if 0` and just
+`return 0`. Every `set_infra`/`qtxpower`/etc. call in this driver is a silent
+no-op. Real traffic to the chip goes only through the WID protocol
+(`wland_proto_cdc_data`).
+
+So the only thing that actually reaches the firmware for AP mode is the WID
+block built by `wland_start_ap_set()` (`wland_cmds.c:608`). That function is
+intact and complete — it sends `WID_802_11I_MODE`, `WID_AUTH_TYPE`,
+`WID_11I_PTKSA_REPLAY_COUNTER`, `WID_BEACON_INTERVAL`, `WID_DTIM_PERIOD`,
+`WID_BSSID`, `WID_SSID`, `WID_NETWORK_EVENT_EN` — but it carries **no operating
+mode and no channel**. `WID_BSS_TYPE = 0x0000` is defined in `wland_wid.h` and
+is **never referenced anywhere in the driver**.
+
+Net: the firmware receives a pile of AP *parameters* while still in infra/STA
+mode, accepts them without error, and never starts beaconing. That is exactly
+the observed behaviour — success reported at every layer, silence on the air.
+
+### Dead lead, recorded so it is not chased again
+
+`iw dev wlan0 info` reports `txpower 1.00 dBm` (vs 31.00 dBm on the RPi3). This
+is **meaningless**. `wland_cfg80211_get_tx_power()` reads `qtxpower` via
+`wland_fil_iovar_data_get()` — the stubbed no-op above — so `txpwrdbm` stays 0,
+and the function then passes it through `wland_qdbm_to_mw()`, a quarter-dBm to
+*milliwatt* conversion, storing a milliwatt figure in the value the stack reads
+as dBm. 0 -> 1 mW -> "1.00 dBm". It is a unit-mangled reading of an
+uninitialised variable, not a power setting. Do not treat low txpower as the
+cause.
+
+### If this is picked up again
+
+1. Find the WID that switches operating mode. `WID_BSS_TYPE` (0x0000) is the
+   obvious candidate — send it as part of, or ahead of, `wland_start_ap_set()`.
+   Values are unknown; the vendor's Android BSP or a WID dump from a working
+   softap is the only source.
+2. No channel WID is sent either — the tethering frequency ConnMan picks
+   (2412) never reaches the chip.
+3. The firmware may simply not implement softap on this part. RDA5991 on this
+   board has never been shown running an AP under Linux by anyone.
+
+**Cost/benefit:** this is open-ended firmware reverse-engineering with no vendor
+documentation. `pvwificonnect-cli improv-serial` reaches the same product goal
+(provisioning an unconfigured device) with no AP at all — same conclusion as
+section 30 reached for Bluetooth.
+
+**Patch 39 is worth keeping regardless:** the AP software path is correct now,
+so if a mode WID is ever found, only that one piece is missing.
