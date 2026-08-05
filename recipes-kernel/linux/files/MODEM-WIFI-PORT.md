@@ -1638,17 +1638,15 @@ something shippable, in the order it is worth doing.
       re-associates unattended at every boot. The 169.254 sighting in §22 was
       an observation made before association completed. See §24.
 
-- [ ] **A2. Give the chip a stable MAC address. BLOCKING.** §25 supersedes
-      §24 here: a device provisioned the **product way** (`pvwificonnect-cli`,
-      which writes only a MAC-keyed connman service) does **not** reconnect
-      after a reboot — verified on hardware. Only the SSID-keyed
-      `home.config` route is MAC-independent. It also leaks one
-      `wifi_<MAC>_…_managed_psk` directory per boot into `/var/lib/connman`,
-      and breaks DHCP reservations, connman service identity and MAC ACLs. The vendor reads it over msys from modem nvram, which a modemless
-      boot does not have. Two workable sources: derive it from the SoC chip id
-      (`CHIP_ID` is readable — §10 saw `0x8810001c`), or store one in the boot
-      partition and pass it on the cmdline. Must be stable across reboots and
-      distinct per board.
+- [x] **A2. ~~Give the chip a stable MAC address.~~ DONE — patches 35-37
+      (§28).** The address is now derived from the boot card's CID inside the
+      driver, at `wland_bus_start` where the random one used to be picked, so
+      it is per-board, stable across reboots and needs no provisioning.
+      `rdawfmac.mac_addr=` pins one to a board instead. Note the doc's earlier
+      suggestion to derive from the SoC `CHIP_ID` would have been wrong:
+      `0x8810001c` is part number plus metal revision (§10 called it "metal id
+      28"), identical on every RDA8810PL of that stepping — every board would
+      have got the same MAC.
 
 - [x] **A3. ~~Make WiFi survive a warm reboot.~~ DONE — patch 34 (§27).**
       `rda_combo_clients_ready()` now calls `rda_wifi_power_off()` before
@@ -2092,3 +2090,127 @@ CLI-provisioned network still will not rejoin afterwards because its ConnMan
 service is keyed to the previous boot's MAC (§25). Unattended operation
 needs A2, or the config.json `network` block (B1) as the SSID-keyed
 workaround.
+
+---
+
+## 28. A2 SOLVED — a stable per-board MAC (2026-08-05, patches 35-37)
+
+The board keeps its address across reboots, and every board gets a different
+one. With §27's warm-reboot fix and pvwificonnect v1.8.1, a provisioned
+network now survives a reboot unattended — the thing §22 set out to check.
+
+### Where the address has to be decided, and why
+
+`wland_bus_start()` calls `wlan_read_mac_from_nvram()`, which looks for
+`/data/misc/wifi/WLANMAC` — an Android-era path absent on a Pantavisor rootfs
+— then falls through to `eth_random_addr()`. Its attempt to write the address
+back for next boot fails for the same reason. Hence a fresh MAC every boot,
+which orphans ConnMan's saved services (keyed `wifi_<mac>_<ssid>_<security>`),
+breaks DHCP reservations and MAC ACLs, and leaks a profile directory per boot.
+
+**Setting it from userspace does not work, and looked like it did.** An
+early-spawn hook running `ifconfig wlan0 hw ether` was tried first: the driver
+implements `ndo_set_mac_address`, the hook reported success, and two
+consecutive boots showed the same address. That was luck. The driver owns the
+address from `bus_start` onward and re-applies it when the interface is
+opened, so the hook races it — measured on the same image, the hook landed at
+5.98s on one boot (silently clobbered back to a random address) and at ~11s on
+another (survived). Timestamps across boots: 5.96, 10.94, 10.99, 5.98s. Two
+green boots were not evidence; the question was never "does it stick once" but
+"does it survive the interface being brought up".
+
+### Getting the CID to the driver
+
+The one per-unit value available at 3.4s is the boot card's CID. Reaching it
+took a detour worth recording:
+
+- The WiFi SDIO card exposes **no** `cid`/`serial` — only `power, rca,
+  removable, revision, subsystem`. The chip has no unique id of its own.
+- `mmc_bus_type` is `static` in `drivers/mmc/core/bus.c` and appears in no
+  public header, so a wireless driver cannot walk the MMC bus. This led to an
+  initial (wrong) conclusion that the CID was unreachable in-kernel.
+- It is reachable: `struct mmc_host` has a public `struct mmc_card *card`, and
+  `mmc_card` exposes `u32 raw_cid[4]` in `linux/mmc/card.h`. **rda-mmc drives
+  every controller on this SoC**, so it can see the boot card even though the
+  wlan driver cannot. Wrong access path, not a missing capability.
+- The host is recovered with `mmc_from_priv()`. The first cut used
+  `priv->mmc`, which oopsed: `struct rda_mmc_host` declares that field but
+  **nothing in the driver ever assigns it** — the only reference was the new
+  one. `NULL pointer dereference at 00000290`, `ldr r3,[r1,#12]` then
+  `ldr r3,[r3,#0x290]`, i.e. `priv->mmc` then `host->card`.
+
+Patch 36 exports the CID (`include/linux/rda-mmc.h`), patch 37 derives from
+it, patch 35 adds `rdawfmac.mac_addr=` to pin one:
+
+```c
+mac[0] = 0x02;                    /* locally administered, unicast */
+mac[1] = (cid[0] >> 16) & 0xff;   /* OEM byte */
+mac[2] = (cid[2] >> 16) & 0xff;   /* ── product serial ── */
+mac[3] = (cid[2] >>  8) & 0xff;
+mac[4] = (cid[2]      ) & 0xff;
+mac[5] = (cid[3] >> 24) & 0xff;
+```
+
+Order: `mac_addr=` → CID → the original nvram/random path.
+
+**Do not bake a constant into the image.** That was proposed and rejected:
+every device flashed from that image would share one MAC, which is worse than
+randomising. And the host cannot derive it at flash time either — through a
+USB reader the card is mass-storage with no CID exposed; the CID is only
+visible from a real MMC host.
+
+### Confirmed on hardware
+
+```
+[3.36] derived mac 02:53:79:78:01:5b from the boot card CID
+wlan0  HWaddr 02:53:79:78:01:5B  inet 192.168.68.148
+```
+
+Same address across cold boot and `reboot -f`; `error -110` count 0. The
+address is the card's serial `0x7978015b` (matching `.../serial`) with the OEM
+byte and the `0x02` prefix — verified against
+CID `0353445350333247807978015b017a62`.
+
+Derivation now happens at **3.36s**, the same instant the driver used to call
+`eth_random_addr()`. There is no longer a window in which anything else could
+set or clobber it. That, not the address value, is the fix.
+
+### The end-to-end result
+
+On the local-source build: provisioned, `reboot -f`, and the device **rejoined
+unattended ~135s later** with no commands issued — the first time provisioning
+has survived a reboot on this board. Re-verified on the published v1.8.1
+build (workspace overlay off, recipes at v1.8.1): same derived MAC, same
+lease, association on a freshly flashed card with an empty `/var/lib/connman`
+— the exact case that used to fail.
+
+### Bench notes
+
+- **`pvr device tty` gained `-b/--baud`** (§26) and now ships in `/usr/bin/pvr`.
+  Its probe sends `\r\n`, which **reopens the pantavisor debug shell**, so
+  shell state does not survive between `run` invocations — a variable set in
+  one call is gone in the next.
+- `pvcontrol cmd defer-reboot` fails with `ERROR: /pantavisor/pv-ctrl not
+  found` if issued before pantavisor's control socket is up. It reports
+  nothing useful, the deferral silently does not happen, and the board reboots
+  ~5 min later taking the containers with it — which presents as
+  `no container found: pvwificonnect` on a later command.
+- Probing the port during power-on lands in u-boot's autoboot window and
+  leaves the board at `=>`. Watch passively while a board is booting.
+- The console serial number moves between `/dev/ttyUSB*` across
+  re-enumeration (seen at ttyUSB1, 3 and 4 in one session). Identify it by
+  `udevadm info -q property -n <port> | grep ID_SERIAL_SHORT` — the i96's
+  FTDI is `A50285BI`.
+
+### Bluetooth, for the record
+
+BLE/Improv provisioning does not work here, but less is missing than expected:
+BlueZ is **already shipped and running** in the `os` (alpine-connman)
+container — `/usr/lib/bluetooth/bluetoothd`, enabled in the default runlevel.
+It never claims `org.bluez` because there is no adapter: the kernel has no
+Bluetooth at all (`CONFIG_BT` unset, no `/sys/class/bluetooth`, 0 BT
+protocols). The combo driver's BT power sequences are already ported. So the
+gap is `CONFIG_BT` plus an HCI transport for the RDA5991's BT half; userspace
+is waiting for it. `pvwificonnect-cli improv-serial` needs no Bluetooth at
+all and is present today, though untested and it would contend with the
+debug console.
