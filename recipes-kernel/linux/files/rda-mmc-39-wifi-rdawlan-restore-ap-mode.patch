@@ -1,0 +1,92 @@
+From: Sergio Marin <sergio.marin@pantacor.com>
+Subject: [PATCH] wifi: rdawlan: restore AP mode so the provisioning AP works
+
+The forward-port built this driver station-only: it commented .start_ap,
+.stop_ap, .change_beacon and .del_station out of the cfg80211 ops table and
+correspondingly dropped NL80211_IFTYPE_AP from wiphy->interface_modes. The
+functions themselves were never removed, and neither were the helpers they
+call (wland_start_ap_set, wland_find_wpaie, wland_parse_tlvs,
+wland_vif_set_mgmt_ie).
+
+That breaks first-boot provisioning. pvwificonnect raises a captive-portal AP
+when the device has no stored credentials, ConnMan asks cfg80211 to start one,
+and there is no .start_ap to call -- so a board with no network and no serial
+console cannot be provisioned at all.
+
+Restore both halves. Registering the ops alone is not enough: without the
+interface_modes bit, cfg80211 refuses an AP request before it ever reaches the
+driver.
+
+Two signatures had drifted since 3.10:
+
+  - stop_ap gained an unsigned int link_id parameter with multi-link support.
+  - del_station now takes struct station_del_parameters instead of a bare
+    u8 *mac; taking the address from params->mac leaves the existing body,
+    including its NULL check, unchanged.
+
+start_ap and change_beacon needed no changes -- 6.6 still passes
+cfg80211_ap_settings and cfg80211_beacon_data respectively.
+
+mgmt_tx remains unported. It is needed for 802.11w MFP SA Query, 802.11r FT
+and WNM, none of which a WPA2-PSK provisioning AP on a full-MAC part requires.
+
+Upstream-Status: Inappropriate [vendor driver, not upstream]
+Signed-off-by: Sergio Marin <sergio.marin@pantacor.com>
+---
+--- a/drivers/net/wireless/rdaw80211/rdawlan/wland_cfg80211.c
++++ b/drivers/net/wireless/rdaw80211/rdawlan/wland_cfg80211.c
+@@ -4559,7 +4559,8 @@ exit:
+ 	return err;
+ }
+ 
+-static int wland_cfg80211_stop_ap(struct wiphy *wiphy, struct net_device *ndev)
++static int wland_cfg80211_stop_ap(struct wiphy *wiphy, struct net_device *ndev,
++	unsigned int link_id)
+ {
+ 	struct wland_if *ifp = netdev_priv(ndev);
+ 	s32 err = 0;
+@@ -4633,8 +4634,9 @@ static s32 wland_cfg80211_change_beacon(struct wiphy *wiphy, struct net_device *
+ 
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 2, 0)
+ static int wland_cfg80211_del_station(struct wiphy *wiphy, struct net_device *ndev,
+-	u8 * mac)
++	struct station_del_parameters *params)
+ {
++	const u8 *mac = params->mac;
+ #ifdef WLAND_P2P_SUPPORT
+ 	struct wland_cfg80211_info *cfg = wiphy_to_cfg(wiphy);
+ #endif /* WLAND_P2P_SUPPORT */
+@@ -5108,12 +5110,12 @@ static struct cfg80211_ops wl_cfg80211_ops = {
+ 	.add_beacon = wland_cfg80211_modify_beacon,
+ 	.del_beacon = wland_cfg80211_modify_beacon,
+ #else /* LINUX_VERSION_CODE < KERNEL_VERSION(3, 4, 0) */
+-	/* .start_ap: dropped with .stop_ap, STA-only build */
+-	/* .stop_ap: AP path, not ported for the STA-only build */
+-	/* .change_beacon: AP path, not ported for the STA-only build */
++	.start_ap = wland_cfg80211_start_ap,
++	.stop_ap = wland_cfg80211_stop_ap,
++	.change_beacon = wland_cfg80211_change_beacon,
+ #endif /* LINUX_VERSION_CODE < KERNEL_VERSION(3, 4, 0) */
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 2, 0)
+-	/* .del_station: AP/mgmt path, not ported for the STA-only build */
++	.del_station = wland_cfg80211_del_station,
+ 	/* .mgmt_tx_cancel_wait: AP/mgmt path, not ported for the STA-only build */
+ #endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(3, 2, 0) */
+ 	/* .sched_scan_start: paired with sched_scan_stop, unused */
+@@ -5375,11 +5377,12 @@ static struct wiphy *wland_setup_wiphy(struct device *phydev)
+ 		| BIT(NL80211_IFTYPE_MONITOR)
+ #endif /* WLAND_MONITOR_SUPPORT */
+ 		/*
+-		 * AP mode is not advertised: the STA-only build does not
+-		 * register .start_ap/.stop_ap/.change_beacon, so claiming
+-		 * the mode would let userspace ask for something we cannot
+-		 * do.
++		 * AP mode: the ops are registered above, so advertise it.
++		 * Without this bit cfg80211 refuses an AP request before it
++		 * ever reaches the driver, and pvwificonnect's provisioning
++		 * AP cannot start.
+ 		 */
++		| BIT(NL80211_IFTYPE_AP)
+ #ifdef WLAND_TBD_SUPPORT
+ 		| BIT(NL80211_IFTYPE_ADHOC)
+ #endif /* WLAND_TBD_SUPPORT */
