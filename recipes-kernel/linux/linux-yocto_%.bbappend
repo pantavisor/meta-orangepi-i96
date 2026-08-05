@@ -73,6 +73,7 @@ SRC_URI:append:orangepi-i96 = " \
     file://rda-mmc-35-wifi-rdawlan-mac-addr-param.patch \
     file://rda-mmc-36-mmc-rda-export-boot-card-cid.patch \
     file://rda-mmc-37-wifi-rdawlan-mac-from-boot-cid.patch \
+    file://rda-mmc-38-wifi-combo-power-bt-on.patch \
 "
 
 # Machine restart and power-off. Unrelated to WiFi, but the WiFi bring-up is

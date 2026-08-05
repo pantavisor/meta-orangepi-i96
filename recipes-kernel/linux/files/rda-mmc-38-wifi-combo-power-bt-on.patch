@@ -1,0 +1,44 @@
+From: Sergio Marin <sergio.marin@pantacor.com>
+Subject: [PATCH] wifi: rda_combo: power the BT half on at init
+
+rda_bt_power_on() and the per-chip sequences behind it have been ported since
+the combo driver landed, but nothing ever called them: rda_combo_clients_ready()
+brought up only the WLAN side. The chip's BT half therefore stayed unpowered,
+so an HCI UART attached to it would have nothing to talk to.
+
+Call it alongside the WLAN power-on. A failure is warned about but not fatal --
+WLAN is why this driver exists, and a board with no BT antenna, or an
+unpopulated combo variant, should still get wlan0.
+
+This is the last device-side piece needed before the stock hci_uart driver can
+be attached to the BT UART; see MODEM-WIFI-PORT.md section 29. Like the WLAN
+power-on above it, it is a bring-up aid that belongs under rfkill eventually.
+
+Upstream-Status: Inappropriate [vendor driver, not upstream]
+Signed-off-by: Sergio Marin <sergio.marin@pantacor.com>
+---
+--- a/drivers/net/wireless/rdaw80211/rdacombodev/rda_combo_power_main.c
++++ b/drivers/net/wireless/rdaw80211/rdacombodev/rda_combo_power_main.c
+@@ -404,6 +404,22 @@ static void rda_combo_clients_ready(struct device *dev)
+ 		dev_warn(dev, "wifi power on failed\n");
+ 	else
+ 		dev_info(dev, "wifi powered on\n");
++
++	/*
++	 * Same for the BT half. Its power sequence has been ported since the
++	 * combo driver landed but nothing ever called it, so the chip's BT
++	 * side stayed dark and the HCI UART had nothing to talk to.
++	 *
++	 * Failure is not fatal: WLAN is the reason this driver exists, and a
++	 * board with no BT antenna or an unpopulated combo variant should
++	 * still get wlan0.
++	 *
++	 * TODO: move under rfkill, together with the WLAN side above.
++	 */
++	if (rda_bt_power_on())
++		dev_warn(dev, "bt power on failed\n");
++	else
++		dev_info(dev, "bt powered on\n");
+ }
+ 
+ static int rda_combo_client_probe(struct i2c_client *client)

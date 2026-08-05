@@ -2331,3 +2331,89 @@ UARTs is muxed for it. Worth 20 minutes before committing to the BT stack.
 `pvwificonnect-client` (the host-side tool) is **BLE-only** and needs BlueZ on
 the *host*; it is unrelated to whether the device has Bluetooth. That naming
 already cost one dead end (§24).
+
+---
+
+## 30. Bluetooth: three of four gates pass, the chip does not answer HCI
+    (2026-08-05, patch 38 + BT kernel config)
+
+BLE provisioning is **not working**. Three prerequisites are now in place and
+verified; the fourth — the chip actually speaking HCI — fails, and the cause is
+not yet established. Recording precisely where it stops so the next attempt
+does not redo this.
+
+### What now works
+
+| Gate | Result |
+|---|---|
+| BT half powered | `rda_combo 0-0016: bt powered on` at 2.55s |
+| Kernel BT stack | `/sys/class/bluetooth` exists; `CONFIG_BT_HCIUART_H4=y` |
+| `btattach` present | `/usr/bin/btattach` in the `os` container |
+| UART node visible in `os` | `/dev/ttyRDA1` |
+| **Chip answers HCI** | **NO — `Bluetooth: hci0: Opcode 0x0c03 failed: -110`** |
+
+`0x0c03` is `HCI_Reset`; `-110` is ETIMEDOUT. Note that **`hci0` appearing
+proves nothing**: `btattach` registers the interface first and the core then
+times out talking to it. `ls /sys/class/bluetooth` showing `hci0` is not
+success.
+
+Two changes landed and are correct regardless of the outcome:
+- **Patch 38** calls `rda_bt_power_on()` from `rda_combo_clients_ready()`. The
+  sequence had been ported since the combo driver landed and **nothing had ever
+  called it**, so the BT half had never been powered on this board.
+- `CONFIG_BT` / `CONFIG_BT_HCIUART` / `CONFIG_BT_HCIUART_H4` (+ SERDEV,
+  RFCOMM/BNEP/HIDP) in `rda8810pl.cfg`, mirroring the vendor.
+
+### What was ruled out
+
+- **Not SDIO.** The combo chip exposes only `mmc1:4829:1` — one function. The
+  vendor config enables no `BT_HCIBTSDIO`/`BT_MRVL`. BT is a UART device.
+- **Not a missing driver.** The vendor ships no RDA-specific Bluetooth code;
+  `drivers/bluetooth/` in their tree is stock. `CONFIG_BT_HCIUART_H4` is the
+  whole transport.
+- **Not simply the wrong node.** Tried both non-console UARTs —
+  `/dev/ttyRDA1` (hw uart1) and `/dev/ttyRDA0` (hw uart2). Identical `-110`.
+- **Probably not baud.** 921600 fails earlier (`Failed to flush serial port:
+  I/O error`), and a rate mismatch normally yields garbage rather than
+  complete silence. Only 115200 and 921600 were tried.
+
+### The open question
+
+**Are the BT UART pads muxed?** This is the board's recurring failure mode —
+I2C1 needed two bits (§10), SDMMC2 needed five whole registers (§15), and in
+both cases the peripheral looked electrically dead until the pads were fixed.
+
+The five pad values we write from u-boot were captured from a **running vendor
+system with wlan0 up** (§15). Whether Bluetooth was also active on that system
+is **unknown** — if it was not, its pads were in GPIO mode in that snapshot
+too, and we copied that state faithfully. Current values, confirmed on the
+board:
+
+```
+0x11a09008 BB_GPIO_Mode   = 0x7FE0003F
+0x11a0900c AP_GPIO_A_Mode = 0x000210FC
+0x11a09010 AP_GPIO_B_Mode = 0x3F00033F
+```
+
+### Next steps, cheapest first
+
+1. **Boot the vendor image, start Bluetooth there, and diff the pad
+   registers** against the values above. This is exactly the method that
+   cracked SDIO in §15 and it answers the question outright. If BT works on the
+   vendor system, its pad map is the answer; if BT does *not* work there
+   either, that reframes the whole task.
+2. Check the schematic (`orangepi_i96_v1_2-print.pdf`, 96boards docs) for which
+   SoC pins the RDA5991 BT UART actually lands on — the vendor never names it,
+   and `.wakeup = 1` on hw uart1 plus `_TGT_AP_GPIO_BT_HOST_WAKE GPIO_B1` is
+   inference, not proof.
+3. Consider that BT may be **modem-attached**. The vendor's own comment on the
+   remaining UART is *"UART2 is for host interface, AP never use"*. If the BT
+   controller hangs off the modem side rather than the AP, an AP-side HCI
+   attach can never work, and this becomes a modem-stack problem like §1/§11
+   was wrongly assumed to be for WiFi.
+
+### If BLE is not specifically required
+
+`pvwificonnect-cli improv-serial` needs no Bluetooth and is already on the
+device. Untested. It would contend with the debug console on uart3 unless one
+of the free UARTs is used.
