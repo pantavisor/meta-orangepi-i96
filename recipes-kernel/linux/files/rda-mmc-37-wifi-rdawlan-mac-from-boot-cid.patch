@@ -1,0 +1,89 @@
+From: Sergio Marin <sergio.marin@pantacor.com>
+Subject: [PATCH] wifi: rdawlan: derive the station MAC from the boot card CID
+
+With no mac_addr= on the cmdline the driver still randomises the station MAC
+on every boot, which orphans ConnMan's saved services (keyed
+wifi_<mac>_<ssid>_<security>), breaks DHCP reservations and defeats MAC ACLs.
+
+Derive one from the boot card's CID instead, via the accessor rda-mmc now
+exports. The CID is unique per card, so the result is stable across reboots
+and distinct between boards with no provisioning step. The obvious
+alternative -- baking a fixed address into the image -- would give every
+device built from that image the same MAC, which is worse than randomising.
+
+CID byte 1 is the high byte of the OEM id and bytes 9..12 are the product
+serial number, the value the MMC core exports as .../serial; 0x02 marks the
+address locally administered and unicast. For the card on the bench
+(CID 0353445350333247807978015b017a62, serial 0x7978015b) that yields
+02:53:79:78:01:5b.
+
+Order is: mac_addr= if given, else the CID, else the existing
+nvram-then-random path. Nothing regresses on boards where neither is
+available.
+
+This ties the address to the SD card rather than the board -- moving the card
+moves the MAC. Boards that need an address pinned to the hardware should pass
+mac_addr=, which takes precedence.
+
+Upstream-Status: Inappropriate [vendor driver, not upstream]
+Signed-off-by: Sergio Marin <sergio.marin@pantacor.com>
+---
+--- a/drivers/net/wireless/rdaw80211/rdawlan/wland_bus.c
++++ b/drivers/net/wireless/rdaw80211/rdawlan/wland_bus.c
+@@ -20,6 +20,7 @@
+ #include <linux/if_arp.h>
+ #include <linux/etherdevice.h>
+ #include <linux/hex.h>
++#include <linux/rda-mmc.h>
+ #include <linux/wireless.h>
+ #include <linux/ieee80211.h>
+ #include <linux/kthread.h>
+@@ -68,6 +69,39 @@ static char *mac_addr_param;
+ module_param_named(mac_addr, mac_addr_param, charp, 0444);
+ MODULE_PARM_DESC(mac_addr, "station MAC address, e.g. 02:11:22:33:44:55");
+ 
++/*
++ * Derive a stable station MAC from the boot card's CID.
++ *
++ * Used when no mac_addr= was given. The CID is unique per card, so this is
++ * stable across reboots and distinct between boards without any provisioning
++ * step -- unlike baking one address into the image, which would give every
++ * device the same MAC. The chip itself offers nothing usable: it has no MAC
++ * storage, and the SDIO function exposes no serial.
++ *
++ * CID byte 1 is the high byte of the OEM id and bytes 9..12 are the product
++ * serial number, the value the MMC core exports as .../serial. 0x02 marks the
++ * result locally administered and unicast.
++ *
++ * NOTE this ties the address to the SD card rather than the board: moving the
++ * card moves the MAC. Pass mac_addr= to pin one to a board instead.
++ */
++static bool wland_mac_from_boot_cid(u8 *mac)
++{
++	u32 cid[4];
++
++	if (!rda_mmc_get_boot_cid(cid))
++		return false;
++
++	mac[0] = 0x02;
++	mac[1] = (cid[0] >> 16) & 0xff;
++	mac[2] = (cid[2] >> 16) & 0xff;
++	mac[3] = (cid[2] >>  8) & 0xff;
++	mac[4] = (cid[2]      ) & 0xff;
++	mac[5] = (cid[3] >> 24) & 0xff;
++
++	return is_valid_ether_addr(mac);
++}
++
+ void wland_txflowcontrol(struct device *dev, bool state)
+ {
+ 	int i = 0;
+@@ -128,6 +162,8 @@ int wland_bus_start(struct device *dev)
+ 	if (mac_addr_param) {
+ 		WLAND_ERR("using mac_addr=%pM from the kernel cmdline\n",
+ 			  mac_addr);
++	} else if (wland_mac_from_boot_cid(mac_addr)) {
++		WLAND_ERR("derived mac %pM from the boot card CID\n", mac_addr);
+ 	} else {
+ 		ret = wlan_read_mac_from_nvram(mac_addr);
+ 		if (ret) {

@@ -1,0 +1,111 @@
+From: Sergio Marin <sergio.marin@pantacor.com>
+Subject: [PATCH] wifi: rdawlan: allow the station MAC to be set on the cmdline
+
+The RDA5991 has no MAC storage of its own. wlan_read_mac_from_nvram() looks
+for /data/misc/wifi/WLANMAC -- an Android-era path that does not exist on a
+Pantavisor rootfs -- so wland_bus_start() falls through to eth_random_addr()
+on every boot, and its attempt to write the address back for next time fails
+for the same reason. The station MAC is therefore different on every boot.
+
+That is not cosmetic. ConnMan keys its saved services
+wifi_<mac>_<ssid>_<security>, so a network provisioned through
+pvwificonnect-cli is orphaned on the next boot and the device never rejoins;
+it also breaks DHCP reservations, defeats MAC ACLs, and leaks one profile
+directory per boot into /var/lib/connman.
+
+Add an optional module parameter:
+
+  rdawfmac.mac_addr=02:53:79:78:01:5b
+
+taken ahead of the nvram lookup, validated with mac_pton() and
+is_valid_ether_addr(). Anything unusable is reported and ignored rather than
+applied, falling through to the existing nvram-then-random path, so a
+malformed value cannot leave the interface with a bogus address. Boards that
+pass nothing behave exactly as before.
+
+It has to be settled here rather than from userspace. Setting the address on
+the netdev afterwards -- via ifconfig hw ether from a boot hook, say -- looks
+like it works but is racy: the driver owns the address from bus_start onward
+and re-applies its own when the interface is opened. Measured on an Orange Pi
+i96, an early-boot hook setting 02:53:79:78:01:5b at 5.98s was silently
+clobbered back to a random address, while the same hook landing at ~11s on
+another boot survived. Same image, different boot, opposite outcome.
+
+Upstream-Status: Inappropriate [vendor driver, not upstream]
+Signed-off-by: Sergio Marin <sergio.marin@pantacor.com>
+---
+--- a/drivers/net/wireless/rdaw80211/rdawlan/wland_bus.c
++++ b/drivers/net/wireless/rdaw80211/rdawlan/wland_bus.c
+@@ -19,6 +19,7 @@
+ #include <linux/kernel.h>
+ #include <linux/if_arp.h>
+ #include <linux/etherdevice.h>
++#include <linux/hex.h>
+ #include <linux/wireless.h>
+ #include <linux/ieee80211.h>
+ #include <linux/kthread.h>
+@@ -48,6 +49,25 @@
+ #include <wland_p2p.h>
+ #include <wland_cfg80211.h>
+ 
++/*
++ * Station MAC address, e.g. rdawfmac.mac_addr=02:53:79:78:01:5b
++ *
++ * The RDA5991 has no MAC storage of its own. wlan_read_mac_from_nvram()
++ * looks for /data/misc/wifi/WLANMAC, an Android-era path that does not exist
++ * on a Pantavisor rootfs, so every boot falls through to eth_random_addr().
++ * An address that changes each boot orphans ConnMan's saved services -- they
++ * are keyed wifi_<mac>_<ssid>_<security> -- and breaks DHCP reservations and
++ * MAC ACLs.
++ *
++ * This has to be settled here rather than from userspace. The driver owns the
++ * address from bus_start onwards and re-applies it when the interface is
++ * opened, so anything written to the netdev afterwards is racy: it survives
++ * or is silently clobbered depending on which lands first.
++ */
++static char *mac_addr_param;
++module_param_named(mac_addr, mac_addr_param, charp, 0444);
++MODULE_PARM_DESC(mac_addr, "station MAC address, e.g. 02:11:22:33:44:55");
++
+ void wland_txflowcontrol(struct device *dev, bool state)
+ {
+ 	int i = 0;
+@@ -99,17 +119,28 @@ int wland_bus_start(struct device *dev)
+ 		return -EINVAL;
+ 	}
+ #if defined(USE_MAC_FROM_RDA_NVRAM)
+-	ret = wlan_read_mac_from_nvram(mac_addr);
+-	if (ret) {
+-		WLAND_ERR("nvram:get a random ether address\n");
+-		eth_random_addr(mac_addr);
+-		if (ret == -EINVAL)
+-			wlan_write_mac_to_nvram(mac_addr);
++	if (mac_addr_param && (!mac_pton(mac_addr_param, mac_addr) ||
++			       !is_valid_ether_addr(mac_addr))) {
++		WLAND_ERR("ignoring unusable mac_addr=%s\n", mac_addr_param);
++		mac_addr_param = NULL;
++	}
++
++	if (mac_addr_param) {
++		WLAND_ERR("using mac_addr=%pM from the kernel cmdline\n",
++			  mac_addr);
+ 	} else {
+-		if (!is_valid_ether_addr(mac_addr)) {
+-			mac_addr[0] &= 0xfe;	/* clear multicast bit */
+-			mac_addr[0] |= 0x02;	/* set local assignment bit (IEEE802) */
+-			WLAND_ERR("nvram:get an invalid ether addr\n");
++		ret = wlan_read_mac_from_nvram(mac_addr);
++		if (ret) {
++			WLAND_ERR("nvram:get a random ether address\n");
++			eth_random_addr(mac_addr);
++			if (ret == -EINVAL)
++				wlan_write_mac_to_nvram(mac_addr);
++		} else {
++			if (!is_valid_ether_addr(mac_addr)) {
++				mac_addr[0] &= 0xfe;	/* clear multicast bit */
++				mac_addr[0] |= 0x02;	/* set local assignment bit (IEEE802) */
++				WLAND_ERR("nvram:get an invalid ether addr\n");
++			}
+ 		}
+ 	}
+ #elif defined(WLAND_MACADDR_DYNAMIC)

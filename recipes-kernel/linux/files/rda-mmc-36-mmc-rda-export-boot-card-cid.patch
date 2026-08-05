@@ -1,0 +1,162 @@
+From: Sergio Marin <sergio.marin@pantacor.com>
+Subject: [PATCH] mmc: rda: export the boot card's CID
+
+The RDA5991 WiFi combo chip has no MAC storage and no unique identifier of
+its own, so rdawlan falls back to a random station MAC on every boot. The SD
+card the board boots from does carry a unique CID, but a wireless driver
+cannot reach it: mmc_bus_type is static to the MMC core and is declared in no
+public header, and an SDIO function can only walk back to its own host, which
+is the WiFi controller rather than the boot one.
+
+rda-mmc drives every MMC controller on this SoC, so it is the one place that
+can see both. Keep a list of probed controllers and expose the CID of the
+first non-SDIO card through a new include/linux/rda-mmc.h, so a stable
+per-board value can be derived without inventing a provisioning step or
+baking a constant into the image -- the latter would give every device the
+same MAC, which is worse than randomising it.
+
+Only memory cards answer CMD2, so the SDIO function has no CID to confuse
+this with; the SDIO card is skipped explicitly regardless.
+
+The host is recovered with mmc_from_priv() rather than a back-pointer:
+struct rda_mmc_host declares an ->mmc field, but nothing in the driver ever
+assigns it, so reading it oopses on a NULL dereference. The rest of the
+driver already uses mmc_from_priv() for this.
+
+The accessor is deliberately read-only and returns false when no memory card
+has been probed yet, leaving callers to fall back rather than fail.
+
+Upstream-Status: Inappropriate [depends on the out-of-tree rdawlan driver]
+Signed-off-by: Sergio Marin <sergio.marin@pantacor.com>
+---
+--- a/drivers/mmc/host/rda-mmc.c
++++ b/drivers/mmc/host/rda-mmc.c
+@@ -14,7 +14,9 @@
+ #include <linux/dma-mapping.h>
+ #include <linux/dmaengine.h>
+ #include <linux/iopoll.h>
++#include <linux/mmc/card.h>
+ #include <linux/mmc/host.h>
++#include <linux/rda-mmc.h>
+ #include <linux/mmc/mmc.h>
+ #include <linux/mmc/slot-gpio.h>
+ #include <linux/module.h>
+@@ -91,6 +93,7 @@
+ #define RDA_MMC_BOUNCE_SIZE SZ_64K
+ 
+ struct rda_mmc_host {
++	struct list_head node;
+ 	struct device *dev;
+ 
+ 	struct mmc_host *mmc;
+@@ -772,6 +775,48 @@ static void rda_mmc_of_parse(struct device_node *np, struct rda_mmc_host *priv)
+ 	priv->mclk_adj = mclk_adj;
+ }
+ 
++/*
++ * Every controller on this SoC is driven by us, so this list is the only
++ * place the boot card's identity is reachable from outside the MMC core:
++ * mmc_bus_type is static there, and a card's own host is the only one an
++ * SDIO function can walk back to. rdawlan uses this to derive a stable
++ * station MAC -- the RDA5991 has neither MAC storage nor a unique id.
++ */
++static DEFINE_SPINLOCK(rda_mmc_hosts_lock);
++static LIST_HEAD(rda_mmc_hosts);
++
++bool rda_mmc_get_boot_cid(u32 cid[4])
++{
++	struct rda_mmc_host *priv;
++	bool found = false;
++
++	spin_lock(&rda_mmc_hosts_lock);
++	list_for_each_entry(priv, &rda_mmc_hosts, node) {
++		/*
++		 * Recover the host from the private area rather than a
++		 * back-pointer: struct rda_mmc_host declares an ->mmc field
++		 * but the driver never assigns it, so it is always NULL.
++		 */
++		struct mmc_card *card = mmc_from_priv(priv)->card;
++
++		/*
++		 * Skip SDIO: the WiFi function has no CID, and on this board
++		 * it is the other controller. Only a memory card answered
++		 * CMD2, so only it has a meaningful serial.
++		 */
++		if (!card || mmc_card_sdio(card))
++			continue;
++
++		memcpy(cid, card->raw_cid, sizeof(card->raw_cid));
++		found = true;
++		break;
++	}
++	spin_unlock(&rda_mmc_hosts_lock);
++
++	return found;
++}
++EXPORT_SYMBOL_GPL(rda_mmc_get_boot_cid);
++
+ static int rda_mmc_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -881,6 +926,10 @@ static int rda_mmc_probe(struct platform_device *pdev)
+ 		goto fail_release_dma;
+ 	}
+ 
++	spin_lock(&rda_mmc_hosts_lock);
++	list_add_tail(&priv->node, &rda_mmc_hosts);
++	spin_unlock(&rda_mmc_hosts_lock);
++
+ 	platform_set_drvdata(pdev, mmc);
+ 	return 0;
+ 
+@@ -895,6 +944,10 @@ static void rda_mmc_remove(struct platform_device *pdev)
+ 	struct mmc_host *mmc = platform_get_drvdata(pdev);
+ 	struct rda_mmc_host *priv = mmc_priv(mmc);
+ 
++	spin_lock(&rda_mmc_hosts_lock);
++	list_del(&priv->node);
++	spin_unlock(&rda_mmc_hosts_lock);
++
+ 	mmc_remove_host(mmc);
+ 	dma_release_channel(priv->dma_rx);
+ 	dma_release_channel(priv->dma_tx);
+diff --git a/include/linux/rda-mmc.h b/include/linux/rda-mmc.h
+new file mode 100644
+index 0000000..b5b8859
+--- /dev/null
++++ b/include/linux/rda-mmc.h
+@@ -0,0 +1,34 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Boot-card identity for RDA8810PL boards.
++ *
++ * Exists for one reason: the RDA5991 WiFi combo chip has no MAC storage and
++ * no unique identifier of its own, so rdawlan randomises its station MAC on
++ * every boot. The SD card the board boots from does carry a unique CID, but
++ * a wireless driver cannot get at it -- mmc_bus_type is static to the MMC
++ * core and the SDIO function only leads back to its own host. The rda-mmc
++ * driver owns both controllers on this SoC, so it is the one place that can
++ * hand the boot card's CID to whoever needs a stable per-board value.
++ */
++#ifndef __LINUX_RDA_MMC_H
++#define __LINUX_RDA_MMC_H
++
++#include <linux/types.h>
++
++#if IS_ENABLED(CONFIG_MMC_RDA)
++/**
++ * rda_mmc_get_boot_cid() - read the CID of the boot (non-SDIO) card
++ * @cid: filled with the raw 128-bit CID, most significant word first,
++ *       matching the order the MMC core's sysfs "cid" attribute prints.
++ *
++ * Return: true if a memory card was found and @cid was filled.
++ */
++bool rda_mmc_get_boot_cid(u32 cid[4]);
++#else
++static inline bool rda_mmc_get_boot_cid(u32 cid[4])
++{
++	return false;
++}
++#endif
++
++#endif /* __LINUX_RDA_MMC_H */
