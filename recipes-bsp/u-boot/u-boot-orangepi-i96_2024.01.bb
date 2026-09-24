@@ -10,13 +10,13 @@ files/rda8810-stage2/ (see its README.md + integration.md)."
 require recipes-bsp/u-boot/u-boot-common.inc
 require recipes-bsp/u-boot/u-boot.inc
 
-DEPENDS += "bc-native dtc-native python3-pyelftools-native"
+DEPENDS += "bc-native dtc-native python3-pyelftools-native u-boot-tools-native"
 
 # the RDA8810 forward-port (the patch): drivers + mach + board + defconfig + DT.
 # Also search poky's u-boot files dir so the CVE patches pulled in by
 # u-boot-common.inc (e.g. CVE-2025-24857.patch) resolve for this recipe.
 FILESEXTRAPATHS:prepend := "${THISDIR}/files:${COREBASE}/meta/recipes-bsp/u-boot/files:"
-SRC_URI += "file://rda8810-stage2"
+SRC_URI += "file://rda8810-stage2 file://rda8810-spl/u-boot-spl.bin"
 
 PROVIDES += "u-boot virtual/bootloader"
 COMPATIBLE_MACHINE = "orangepi-i96"
@@ -32,8 +32,40 @@ SRC_URI:remove = "file://pv.distroboot.cfg"
 UBOOT_MACHINE = "rda8810pl_orangepi_i96_defconfig"
 # The machine conf sets UBOOT_SUFFIX="rda" for the old vendor RDA-packaged output.
 # Our modern stage-2 produces a plain u-boot.bin; the bootable .rda (SPL + stage-2)
-# is assembled separately (package-bootloader.sh / mk-sd-image.sh).
+# is assembled in do_deploy below, for the .wks rawcopy to pick up.
 UBOOT_SUFFIX = "bin"
+
+# bootloader.rda = the blob the BootROM loads from SD offset 0x20000, in the
+# vendor mkrdaimage layout:
+#   [0x00000] uImage(u-boot-spl.bin), standalone, load/entry 0x100100
+#   [0x0c000] 24K partition table -- all zeros in every known-good blob
+#   [0x12000] uImage(u-boot.bin), firmware, load/entry 0x80008000
+# The vendor SPL skips the 64-byte header when it copies stage-2 to
+# TEXT_BASE-64, so u-boot lands at TEXT_BASE. Byte-identical (bar timestamps
+# and CRCs) to the hand-assembled blob verified on the bench.
+RDA_SPL_LOADADDR = "0x100100"
+RDA_UBOOT_TEXT_BASE = "0x80008000"
+RDA_BOOTLOADER = "bootloader.rda"
+
+do_deploy:append() {
+    rda="${WORKDIR}/rda-bootloader"
+    rm -rf "$rda"
+    mkdir -p "$rda"
+    uboot-mkimage -A arm -O u-boot -T standalone -C none \
+        -a ${RDA_SPL_LOADADDR} -e ${RDA_SPL_LOADADDR} -n u-boot-spl \
+        -d ${WORKDIR}/rda8810-spl/u-boot-spl.bin "$rda/spl.img"
+    uboot-mkimage -A arm -O u-boot -T firmware -C none \
+        -a ${RDA_UBOOT_TEXT_BASE} -e ${RDA_UBOOT_TEXT_BASE} -n u-boot \
+        -d ${B}/${UBOOT_BINARY} "$rda/u-boot.img"
+    spl_size=$(stat -c%s "$rda/spl.img")
+    if [ "$spl_size" -gt 49152 ]; then
+        bbfatal "SPL image is $spl_size bytes, over the 48K budget"
+    fi
+    cp "$rda/spl.img" "$rda/${RDA_BOOTLOADER}"
+    truncate -s 73728 "$rda/${RDA_BOOTLOADER}"
+    cat "$rda/u-boot.img" >> "$rda/${RDA_BOOTLOADER}"
+    install -m 644 "$rda/${RDA_BOOTLOADER}" ${DEPLOYDIR}/${RDA_BOOTLOADER}
+}
 
 # Drop our port files into the u-boot tree + apply the small Kconfig/Makefile hooks
 # (verified to build standalone; see files/rda8810-stage2/integration.md).

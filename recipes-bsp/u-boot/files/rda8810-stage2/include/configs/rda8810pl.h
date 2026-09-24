@@ -26,9 +26,12 @@
  * rda-uart driver registers ttyRDA<alias#> => console=ttyRDA2.
  * Memory map (256 MB @ 0x80000000): u-boot @0x80008000, DMA bounce @0x81000000,
  * scripts/env @loadaddr 0x82000000, fdt @0x83000000, kernel @0x84000000,
- * ramdisk @0x85000000 (initramfs Load Address, clears the ~12 MB zImage). */
+ * ramdisk @0x85000000 (initramfs Load Address, clears the ~12 MB zImage).
+ * mmcdev: the SD card is mmc 0 here. boot.scr falls back to mmc 1 when neither
+ * ${devnum} nor ${mmcdev} is set, and the bootcmd sets neither. */
 #define CFG_EXTRA_ENV_SETTINGS \
 	"loadaddr=0x82000000\0" \
+	"mmcdev=0\0" \
 	"console=ttyRDA2\0" \
 	"fdtfile=rda8810pl-orangepi-i96.dtb\0" \
 	"kernel_addr_r=0x84000000\0" \
