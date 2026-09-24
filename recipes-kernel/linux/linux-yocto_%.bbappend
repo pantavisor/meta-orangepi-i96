@@ -9,7 +9,6 @@ COMPATIBLE_MACHINE:orangepi-i96 = "orangepi-i96"
 KMACHINE:orangepi-i96 = "orangepi-i96"
 KBUILD_DEFCONFIG:orangepi-i96 = "multi_v7_defconfig"
 KCONFIG_MODE:orangepi-i96 = "alldefconfig"
-KERNEL_DEVICETREE:orangepi-i96 = "unisoc/rda8810pl-orangepi-i96.dtb"
 SRC_URI:append:orangepi-i96 = " file://rda8810pl.cfg"
 
 # SD/MMC support: backport of Dang Huynh's mainline series "RDA8810PL SD/MMC
