@@ -54,10 +54,16 @@ CONFIG_RDA_COMBO_POWER_AUTO=y
 #     0x11a0005c Cfg_Clk_Auxclk) are poked by hand during the same bring-up ---
 CONFIG_CMD_MEMORY=y
 
-# --- filesystems: read kernel/FIT + pantavisor pv.env from ext boot part ---
+# --- filesystems: the boot partition (p1) is vfat, the only filesystem this
+# u-boot writes: the boot script saves pantavisor's pv.env there on every try
+# boot. ext4 stays read-only (trails on p2): u-boot 2024.01 cannot write the
+# metadata_csum ext4 Yocto makes, and without a write pv.env was never saved
+# ("** Unable to write file pv.env **"), so try-boot state never persisted.
 CONFIG_FS_EXT4=y
 CONFIG_CMD_EXT4=y
 CONFIG_CMD_EXT2=y
+CONFIG_FS_FAT=y
+CONFIG_FAT_WRITE=y
 CONFIG_CMD_FAT=y
 CONFIG_CMD_FS_GENERIC=y
 
@@ -79,13 +85,25 @@ CONFIG_CMD_IMPORTENV=y
 CONFIG_CMD_EXPORTENV=y
 CONFIG_CMD_SAVEENV=y
 
-# --- env: pantavisor keeps pv.env as a file on the ext boot partition (mmc 0:1) ---
-CONFIG_ENV_IS_IN_EXT4=y
-CONFIG_ENV_EXT4_INTERFACE="mmc"
-CONFIG_ENV_EXT4_DEVICE_AND_PART="0:1"
-CONFIG_ENV_EXT4_FILE="/uboot.env"
+# --- env: pantavisor keeps pv.env as a file on the vfat boot partition (mmc 0:1) ---
+CONFIG_ENV_IS_IN_FAT=y
+CONFIG_ENV_FAT_INTERFACE="mmc"
+CONFIG_ENV_FAT_DEVICE_AND_PART="0:1"
+CONFIG_ENV_FAT_FILE="uboot.env"
 
+# --- autoboot: a stray byte on the console (a host opening the port, the
+# board's own output echoed back) used to stop the boot at the prompt, where
+# it stayed. Only the string "pvstop" stops it now, input received before the
+# countdown is dropped, an idle prompt resets after 60 s, and a boot script
+# that returns resets instead of leaving the board at the prompt.
 CONFIG_BOOTDELAY=1
+CONFIG_AUTOBOOT_KEYED=y
+CONFIG_AUTOBOOT_PROMPT="Autoboot in %d seconds, type 'pvstop' for the prompt\n"
+CONFIG_AUTOBOOT_STOP_STR="pvstop"
+CONFIG_AUTOBOOT_FLUSH_STDIN=y
+CONFIG_BOOT_RETRY=y
+CONFIG_BOOT_RETRY_TIME=60
+CONFIG_RESET_TO_RETRY=y
 # default bootcmd mirrors the vendor: load + source boot.scr from the boot partition
 CONFIG_USE_BOOTCOMMAND=y
-CONFIG_BOOTCOMMAND="mmc dev 0; load mmc 0:1 ${loadaddr} boot.scr && source ${loadaddr}"
+CONFIG_BOOTCOMMAND="mmc dev 0; load mmc 0:1 ${loadaddr} boot.scr && source ${loadaddr}; reset"

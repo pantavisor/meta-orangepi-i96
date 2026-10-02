@@ -1,7 +1,8 @@
 # OrangePi i96 (RDA8810PL) SD-card layout — mirrors the vendor Debian image:
 #   - bootloader blob (vendor SPL + modern u-boot stage-2) raw in the 2 MB gap,
 #     SPL @ 0x20000 (see package-bootloader.sh / mkrdaimage layout)
-#   - ext boot partition (boot.scr, kernel/FIT, pantavisor boot files)  @ 2 MB
+#   - vfat boot partition (boot.scr, kernel/FIT, pantavisor boot files) @ 2 MB;
+#     vfat because u-boot must write pantavisor's pv.env there on try boots
 #   - ext4 rootfs (pantavisor storage) on p2, labelled "root": pantavisor finds
 #     its storage by PV_STORAGE_DEVICE=LABEL=root
 #
@@ -11,7 +12,7 @@
 
 part --source rawcopy --sourceparams="file=bootloader.rda" --no-table --offset 128K
 
-part /boot --source bootimg-partition --fstype=ext4 --label boot --offset 2048K --size 50M --align 2048
+part /boot --source bootimg-partition --fstype=vfat --label boot --offset 2048K --size 50M --align 2048
 
 part / --source rootfs --fstype=ext4 --label root --align 2048
 
