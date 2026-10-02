@@ -1,0 +1,397 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sergio Marin <sergio.marin@pantacor.com>
+Date: Thu, 1 Oct 2026 21:05:03 -0300
+Subject: [PATCH] wifi: rda-combo: release the power token on every path
+
+rda_wifi_bt_comp serialises the combo power sequences as a one-token
+semaphore: init completes it once, and each wifi/bt power-on waits for it.
+Only the success path gave the token back. A power-on that failed (an I2C
+NAK, a failed table write) returned -1 still holding it, and every later
+rda_wifi_power_on()/rda_bt_power_on() blocked for good, uninterruptibly.
+
+Since patches 34 and 38 power the combo off, then wifi on, then bt on from
+the I2C client probe, one failed wifi power-on (likely after a warm reboot,
+with the chip still mid-session) hung the probe and with it the boot.
+
+Move each power-on body into an inner function and take and give back the
+token around it, whatever it returns.
+
+Upstream-Status: Inappropriate [vendor driver, not upstream]
+---
+ .../rdacombodev/rda_5991_power_ctrl.c         | 40 ++++++++++++++-----
+ .../rdacombodev/rda_5991e_power_ctrl.c        | 40 ++++++++++++++-----
+ .../rdacombodev/rda_5991f_power_ctrl.c        | 40 ++++++++++++++-----
+ .../rdacombodev/rda_5991g_power_ctrl.c        | 40 ++++++++++++++-----
+ 4 files changed, 120 insertions(+), 40 deletions(-)
+
+diff --git a/drivers/net/wireless/rdaw80211/rdacombodev/rda_5991_power_ctrl.c b/drivers/net/wireless/rdaw80211/rdacombodev/rda_5991_power_ctrl.c
+index 0da51d0..7f53753 100644
+--- a/drivers/net/wireless/rdaw80211/rdacombodev/rda_5991_power_ctrl.c
++++ b/drivers/net/wireless/rdaw80211/rdacombodev/rda_5991_power_ctrl.c
+@@ -380,13 +380,10 @@ static int rda_5991_wifi_debug_en(void)
+ 	return ret;
+ }
+ 
+-int rda_5991_wifi_power_on(void)
++static int __rda_5991_wifi_power_on(void)
+ {
+ 	int ret = 0, bt_power_on = 0;
+ 
+-	//if bt is power on wait until it's complete
+-	wait_for_completion(&rda_wifi_bt_comp);
+-
+ 	rda_combo_i2c_lock();
+ 	enable_26m_regulator(CLOCK_WLAN);
+ 	enable_32k_rtc(CLOCK_WLAN);
+@@ -435,7 +432,6 @@ int rda_5991_wifi_power_on(void)
+ 	rda_combo_i2c_unlock();
+ 	msleep(100);
+ 	disable_26m_rtc(CLOCK_WLAN);
+-	complete(&rda_wifi_bt_comp);
+ #ifdef RDA_COMBO_FROM_FIRMWARE
+ 	atomic_set(&wifi_fw_status, 1);
+ #endif
+@@ -451,6 +447,20 @@ err:
+ 	return -1;
+ }
+ 
++/* One power sequence at a time. The token is given back on every path:
++ * a power-on that failed used to keep it, and every later power-on then
++ * blocked for good (at boot, since the combo is powered from client probe).
++ */
++int rda_5991_wifi_power_on(void)
++{
++	int ret;
++
++	wait_for_completion(&rda_wifi_bt_comp);
++	ret = __rda_5991_wifi_power_on();
++	complete(&rda_wifi_bt_comp);
++	return ret;
++}
++
+ int rda_5991_wifi_power_off(void)
+ {
+ 	int ret = 0;
+@@ -493,13 +503,10 @@ int rda_5991_wifi_power_off(void)
+ 	return ret;
+ }
+ 
+-int rda_5991_bt_power_on(void)
++static int __rda_5991_bt_power_on(void)
+ {
+ 	int ret = 0, wifi_power_on = 0;
+ 
+-	//if wifi is power on wait until it's complete
+-	wait_for_completion(&rda_wifi_bt_comp);
+-
+ 	rda_combo_i2c_lock();
+ 	enable_26m_regulator(CLOCK_BT);
+ 	enable_26m_rtc(CLOCK_BT);
+@@ -527,7 +534,6 @@ int rda_5991_bt_power_on(void)
+ 	rda_combo_i2c_unlock();
+ 	msleep(10);
+ 	disable_26m_rtc(CLOCK_BT);
+-	complete(&rda_wifi_bt_comp);
+ #ifdef RDA_COMBO_FROM_FIRMWARE
+ 	atomic_set(&bt_fw_status, 1);
+ #endif
+@@ -541,6 +547,20 @@ err:
+ 	return -1;
+ }
+ 
++/* One power sequence at a time. The token is given back on every path:
++ * a power-on that failed used to keep it, and every later power-on then
++ * blocked for good (at boot, since the combo is powered from client probe).
++ */
++int rda_5991_bt_power_on(void)
++{
++	int ret;
++
++	wait_for_completion(&rda_wifi_bt_comp);
++	ret = __rda_5991_bt_power_on();
++	complete(&rda_wifi_bt_comp);
++	return ret;
++}
++
+ int rda_5991_bt_power_off(void)
+ {
+ 	int ret = 0;
+diff --git a/drivers/net/wireless/rdaw80211/rdacombodev/rda_5991e_power_ctrl.c b/drivers/net/wireless/rdaw80211/rdacombodev/rda_5991e_power_ctrl.c
+index e528388..9ddd79a 100644
+--- a/drivers/net/wireless/rdaw80211/rdacombodev/rda_5991e_power_ctrl.c
++++ b/drivers/net/wireless/rdaw80211/rdacombodev/rda_5991e_power_ctrl.c
+@@ -428,16 +428,13 @@ static int rda_5991e_wifi_debug_en(int enable)
+ 	return ret;
+ }
+ 
+-int rda_5991e_wifi_power_on(void)
++static int __rda_5991e_wifi_power_on(void)
+ {
+ 	int ret = 0, bt_power_on = 0;
+ 	u16 value;
+ 	bool need_retry;
+ 	int retry_count = 0;
+ 
+-	//if bt is power on wait until it's complete
+-	wait_for_completion(&rda_wifi_bt_comp);
+-
+ 	rda_combo_i2c_lock();
+ 	enable_26m_regulator(CLOCK_WLAN);
+ 	enable_32k_rtc(CLOCK_WLAN);
+@@ -496,7 +493,6 @@ retry:
+ 	rda_combo_i2c_unlock();
+ 	msleep(100);
+ 	disable_26m_rtc(CLOCK_WLAN);
+-	complete(&rda_wifi_bt_comp);
+ #ifdef RDA_COMBO_FROM_FIRMWARE
+ 	atomic_set(&wifi_fw_status, 1);
+ #endif
+@@ -512,6 +508,20 @@ err:
+ 	return -1;
+ }
+ 
++/* One power sequence at a time. The token is given back on every path:
++ * a power-on that failed used to keep it, and every later power-on then
++ * blocked for good (at boot, since the combo is powered from client probe).
++ */
++int rda_5991e_wifi_power_on(void)
++{
++	int ret;
++
++	wait_for_completion(&rda_wifi_bt_comp);
++	ret = __rda_5991e_wifi_power_on();
++	complete(&rda_wifi_bt_comp);
++	return ret;
++}
++
+ int rda_5991e_wifi_power_off(void)
+ {
+ 	int ret = 0, bt_power_on = 0;
+@@ -553,13 +563,10 @@ int rda_5991e_wifi_power_off(void)
+ 	return ret;
+ }
+ 
+-int rda_5991e_bt_power_on(void)
++static int __rda_5991e_bt_power_on(void)
+ {
+ 	int ret = 0, wifi_power_on = 0;
+ 
+-	//if wifi is power on wait until it's complete
+-	wait_for_completion(&rda_wifi_bt_comp);
+-
+ 	rda_combo_i2c_lock();
+ 	enable_26m_regulator(CLOCK_BT);
+ 	enable_26m_rtc(CLOCK_BT);
+@@ -587,7 +594,6 @@ int rda_5991e_bt_power_on(void)
+ 	rda_combo_i2c_unlock();
+ 	msleep(10);
+ 	disable_26m_rtc(CLOCK_BT);
+-	complete(&rda_wifi_bt_comp);
+ #ifdef RDA_COMBO_FROM_FIRMWARE
+ 	atomic_set(&bt_fw_status, 1);
+ #endif
+@@ -601,6 +607,20 @@ err:
+ 	return -1;
+ }
+ 
++/* One power sequence at a time. The token is given back on every path:
++ * a power-on that failed used to keep it, and every later power-on then
++ * blocked for good (at boot, since the combo is powered from client probe).
++ */
++int rda_5991e_bt_power_on(void)
++{
++	int ret;
++
++	wait_for_completion(&rda_wifi_bt_comp);
++	ret = __rda_5991e_bt_power_on();
++	complete(&rda_wifi_bt_comp);
++	return ret;
++}
++
+ int rda_5991e_bt_power_off(void)
+ {
+ 	int ret = 0;
+diff --git a/drivers/net/wireless/rdaw80211/rdacombodev/rda_5991f_power_ctrl.c b/drivers/net/wireless/rdaw80211/rdacombodev/rda_5991f_power_ctrl.c
+index 3f7be4c..7d1477b 100644
+--- a/drivers/net/wireless/rdaw80211/rdacombodev/rda_5991f_power_ctrl.c
++++ b/drivers/net/wireless/rdaw80211/rdacombodev/rda_5991f_power_ctrl.c
+@@ -409,13 +409,10 @@ static int rda_5991f_wifi_debug_en(int enable)
+ 	return ret;
+ }
+ 
+-int rda_5991f_wifi_power_on(void)
++static int __rda_5991f_wifi_power_on(void)
+ {
+ 	int ret = 0, bt_power_on = 0;
+ 
+-	//if bt is power on wait until it's complete
+-	wait_for_completion(&rda_wifi_bt_comp);
+-
+ 	rda_combo_i2c_lock();
+ 	enable_26m_regulator(CLOCK_WLAN);
+ 	enable_32k_rtc(CLOCK_WLAN);
+@@ -460,7 +457,6 @@ int rda_5991f_wifi_power_on(void)
+ 	rda_combo_i2c_unlock();
+ 	msleep(100);
+ 	disable_26m_rtc(CLOCK_WLAN);
+-	complete(&rda_wifi_bt_comp);
+ #ifdef RDA_COMBO_FROM_FIRMWARE
+ 	atomic_set(&wifi_fw_status, 1);
+ #endif
+@@ -476,6 +472,20 @@ err:
+ 	return -1;
+ }
+ 
++/* One power sequence at a time. The token is given back on every path:
++ * a power-on that failed used to keep it, and every later power-on then
++ * blocked for good (at boot, since the combo is powered from client probe).
++ */
++int rda_5991f_wifi_power_on(void)
++{
++	int ret;
++
++	wait_for_completion(&rda_wifi_bt_comp);
++	ret = __rda_5991f_wifi_power_on();
++	complete(&rda_wifi_bt_comp);
++	return ret;
++}
++
+ int rda_5991f_wifi_power_off(void)
+ {
+ 	int ret = 0, bt_power_on = 0;
+@@ -517,13 +527,10 @@ int rda_5991f_wifi_power_off(void)
+ 	return ret;
+ }
+ 
+-int rda_5991f_bt_power_on(void)
++static int __rda_5991f_bt_power_on(void)
+ {
+ 	int ret = 0, wifi_power_on = 0;
+ 
+-	//if wifi is power on wait until it's complete
+-	wait_for_completion(&rda_wifi_bt_comp);
+-
+ 	rda_combo_i2c_lock();
+ 	enable_26m_regulator(CLOCK_BT);
+ 	enable_26m_rtc(CLOCK_BT);
+@@ -551,7 +558,6 @@ int rda_5991f_bt_power_on(void)
+ 	rda_combo_i2c_unlock();
+ 	msleep(10);
+ 	disable_26m_rtc(CLOCK_BT);
+-	complete(&rda_wifi_bt_comp);
+ #ifdef RDA_COMBO_FROM_FIRMWARE
+ 	atomic_set(&bt_fw_status, 1);
+ #endif
+@@ -565,6 +571,20 @@ err:
+ 	return -1;
+ }
+ 
++/* One power sequence at a time. The token is given back on every path:
++ * a power-on that failed used to keep it, and every later power-on then
++ * blocked for good (at boot, since the combo is powered from client probe).
++ */
++int rda_5991f_bt_power_on(void)
++{
++	int ret;
++
++	wait_for_completion(&rda_wifi_bt_comp);
++	ret = __rda_5991f_bt_power_on();
++	complete(&rda_wifi_bt_comp);
++	return ret;
++}
++
+ int rda_5991f_bt_power_off(void)
+ {
+ 	int ret = 0;
+diff --git a/drivers/net/wireless/rdaw80211/rdacombodev/rda_5991g_power_ctrl.c b/drivers/net/wireless/rdaw80211/rdacombodev/rda_5991g_power_ctrl.c
+index 26c8eda..44bcf83 100644
+--- a/drivers/net/wireless/rdaw80211/rdacombodev/rda_5991g_power_ctrl.c
++++ b/drivers/net/wireless/rdaw80211/rdacombodev/rda_5991g_power_ctrl.c
+@@ -482,13 +482,10 @@ static int rda_5991g_wifi_debug_en(int enable)
+ 	return ret;
+ }
+ 
+-int rda_5991g_wifi_power_on(void)
++static int __rda_5991g_wifi_power_on(void)
+ {
+ 	int ret = 0, bt_power_on = 0;
+ 
+-	//if bt is power on wait until it's complete
+-	wait_for_completion(&rda_wifi_bt_comp);
+-
+ 	rda_combo_i2c_lock();
+ 	enable_26m_regulator(CLOCK_WLAN);
+ 	enable_32k_rtc(CLOCK_WLAN);
+@@ -535,7 +532,6 @@ int rda_5991g_wifi_power_on(void)
+ 	rda_combo_i2c_unlock();
+ 	msleep(100);
+ 	disable_26m_rtc(CLOCK_WLAN);
+-	complete(&rda_wifi_bt_comp);
+ #ifdef RDA_COMBO_FROM_FIRMWARE
+ 	atomic_set(&wifi_fw_status, 1);
+ #endif
+@@ -551,6 +547,20 @@ err:
+ 	return -1;
+ }
+ 
++/* One power sequence at a time. The token is given back on every path:
++ * a power-on that failed used to keep it, and every later power-on then
++ * blocked for good (at boot, since the combo is powered from client probe).
++ */
++int rda_5991g_wifi_power_on(void)
++{
++	int ret;
++
++	wait_for_completion(&rda_wifi_bt_comp);
++	ret = __rda_5991g_wifi_power_on();
++	complete(&rda_wifi_bt_comp);
++	return ret;
++}
++
+ int rda_5991g_wifi_power_off(void)
+ {
+ 	int ret = 0, bt_power_on = 0;
+@@ -595,13 +605,10 @@ int rda_5991g_wifi_power_off(void)
+ 	return ret;
+ }
+ 
+-int rda_5991g_bt_power_on(void)
++static int __rda_5991g_bt_power_on(void)
+ {
+ 	int ret = 0, wifi_power_on = 0;
+ 
+-	//if wifi is power on wait until it's complete
+-	wait_for_completion(&rda_wifi_bt_comp);
+-
+ 	rda_combo_i2c_lock();
+ 	enable_26m_regulator(CLOCK_BT);
+ 	enable_26m_rtc(CLOCK_BT);
+@@ -629,7 +636,6 @@ int rda_5991g_bt_power_on(void)
+ 	rda_combo_i2c_unlock();
+ 	msleep(10);
+ 	disable_26m_rtc(CLOCK_BT);
+-	complete(&rda_wifi_bt_comp);
+ #ifdef RDA_COMBO_FROM_FIRMWARE
+ 	atomic_set(&bt_fw_status, 1);
+ #endif
+@@ -643,6 +649,20 @@ err:
+ 	return -1;
+ }
+ 
++/* One power sequence at a time. The token is given back on every path:
++ * a power-on that failed used to keep it, and every later power-on then
++ * blocked for good (at boot, since the combo is powered from client probe).
++ */
++int rda_5991g_bt_power_on(void)
++{
++	int ret;
++
++	wait_for_completion(&rda_wifi_bt_comp);
++	ret = __rda_5991g_bt_power_on();
++	complete(&rda_wifi_bt_comp);
++	return ret;
++}
++
+ int rda_5991g_bt_power_off(void)
+ {
+ 	int ret = 0;

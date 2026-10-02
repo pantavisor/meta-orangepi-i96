@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sergio Marin <sergio.marin@pantacor.com>
+Date: Thu, 1 Oct 2026 21:05:03 -0300
+Subject: [PATCH] wifi: rdawlan: keep the shutdown path minimal
+
+.shutdown ran the full teardown on every reboot: unregister the netdev,
+detach cfg80211, release an RTNL it might not hold (wland_del_if), with the
+bus timers and work items still running, which could hang device_shutdown
+so the board never reset. It also left the chip powered and mid-session,
+so the next boot started against a busy chip.
+
+Stop the chip's SDIO interrupt and power it off; leave the rest to the
+reset.
+
+Upstream-Status: Inappropriate [vendor driver, not upstream]
+---
+ .../net/wireless/rdaw80211/rdawlan/wland_linux.c  | 15 ++++++++++++---
+ 1 file changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/net/wireless/rdaw80211/rdawlan/wland_linux.c b/drivers/net/wireless/rdaw80211/rdawlan/wland_linux.c
+index e907cda..596bac9 100644
+--- a/drivers/net/wireless/rdaw80211/rdawlan/wland_linux.c
++++ b/drivers/net/wireless/rdaw80211/rdawlan/wland_linux.c
+@@ -1103,15 +1103,24 @@ static void __exit wlanfmac_module_exit(void)
+ 	WLAND_DBG(DEFAULT, TRACE, "Done\n");
+ }
+ 
++/*
++ * Reboot and power-off path: keep it minimal. It used to run the full
++ * teardown (unregister the netdev, detach cfg80211, take and release an RTNL
++ * it might not hold) with the bus timers and work items still live, which
++ * could hang device_shutdown so the board never reset; and it left the chip
++ * powered and mid-session for the next boot. Now: stop the chip's interrupt
++ * and power it off.
++ */
+ void rda_wland_shutdown(struct device *dev)
+ {
+ 	struct wland_bus *bus_if = dev_get_drvdata(dev);
+-	struct wland_sdio_dev *sdiodev = bus_if->bus_priv.sdio;
++	struct wland_sdio_dev *sdiodev = bus_if ? bus_if->bus_priv.sdio : NULL;
+ 
+ 	WLAND_DBG(DEFAULT, TRACE, "Enter\n");
+ 	cancel_work_sync(&wland_driver_work);
+-	wland_sdio_release(sdiodev->bus);
+-	wland_debugfs_exit();
++	if (sdiodev && sdiodev->func)
++		wland_sdio_intr_unregister(sdiodev);
++	rda_wifi_power_off();
+ 	WLAND_DBG(DEFAULT, TRACE, "Done\n");
+ }
+ 
