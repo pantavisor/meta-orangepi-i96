@@ -1,0 +1,38 @@
+#!/bin/sh
+# Pantavisor storage mount helper, run as `pvmnt.bootvfat <mountpoint>` when
+# PV_STORAGE_MNTTYPE=bootvfat (pantavisor mount.c).
+#
+# Mounts the ext4 storage as pantavisor would, then the vfat boot partition
+# over <storage>/boot, so pantavisor's boot environment (uboot.txt) lives on
+# FAT. u-boot reads ext4 without replaying its journal: a uboot.txt pantavisor
+# had rewritten could still read back old after a reboot without a clean
+# unmount (a power cut), and u-boot then booted, and pantavisor committed, a
+# revision from hours before. FAT has no journal: what was written is what
+# u-boot reads. The boot script reads uboot.txt from the boot partition when
+# u-boot's pv_boot_env_on_bootpart is set (the i96's default environment).
+#
+# Layout fixed by wic/orangepi-i96.wks: the SD card is mmcblk0, p1 is the
+# vfat boot partition, p2 the ext4 storage.
+set -e
+
+path="$1"
+data=/dev/mmcblk0p2
+boot=/dev/mmcblk0p1
+
+mount -t ext4 "$data" "$path"
+mkdir -p "$path/boot"
+
+# First boot with this helper: carry the boot environment pantavisor kept on
+# ext4 over to the boot partition, before the mount hides it.
+stage=/tmp/pvmnt-bootvfat
+mkdir -p "$stage"
+mount -t vfat "$boot" "$stage"
+if [ ! -f "$stage/uboot.txt" ] && [ -f "$path/boot/uboot.txt" ]; then
+	cp "$path/boot/uboot.txt" "$stage/uboot.txt"
+	sync
+fi
+umount "$stage"
+
+# sync: directory and FAT updates reach the card with the data, so a power
+# cut leaves either the old file or the new one.
+mount -t vfat -o sync "$boot" "$path/boot"
