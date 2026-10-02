@@ -1,0 +1,321 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sergio Marin <sergio.marin@pantacor.com>
+Date: Thu, 1 Oct 2026 21:05:03 -0300
+Subject: [PATCH] mmc: rda: let the request path own its request
+
+Two ways this driver wedged or corrupted SD/SDIO I/O:
+
+- The IRQ thread finished data requests itself, while the request path
+  could still be sending the command into the same request (the command
+  phase polls with sleeping waits): it then wrote resp/error into a request
+  the core had already been handed back, and two contexts programmed the
+  controller at once.
+- After a 5 s data timeout the IRQ thread's complete() found no waiter, so
+  the completion stayed set and every later wait returned at once; from
+  then on a lost DAT_OVER left a request outstanding forever.
+
+The IRQ thread now only signals the request path; the request path re-arms
+the completion per request, takes the request back under the lock and does
+the DMA check, abort and bounce copy-out itself. The hard IRQ reads the
+request once, under the lock, instead of twice without it.
+
+Upstream-Status: Inappropriate [local fix of a backported not-yet-merged series]
+---
+ drivers/mmc/host/rda-mmc.c | 235 +++++++++++++++++--------------------
+ 1 file changed, 110 insertions(+), 125 deletions(-)
+
+diff --git a/drivers/mmc/host/rda-mmc.c b/drivers/mmc/host/rda-mmc.c
+index 580d917..36155ac 100644
+--- a/drivers/mmc/host/rda-mmc.c
++++ b/drivers/mmc/host/rda-mmc.c
+@@ -407,6 +407,80 @@ static void rda_mmc_data_abort(struct mmc_host *host, struct mmc_request *mrq)
+ 	}
+ }
+ 
++static void rda_mmc_crc_status(struct mmc_host *host)
++{
++	struct rda_mmc_host *priv = mmc_priv(host);
++	struct device *dev = mmc_dev(host);
++	void __iomem *base = priv->base;
++	const char *crc_error;
++	u32 status;
++
++	status = readl_relaxed(base + SDMMC_REG_STATUS);
++
++	switch (FIELD_GET(SDMMC_STATUS_CRC_STATUS, status)) {
++	case 0b101:
++		crc_error = "Transmission Error";
++		break;
++	case 0b010:
++		crc_error = "Transmission Right";
++		break;
++	case 0b111:
++		crc_error = "Flash Programming Error";
++		break;
++	default:
++		crc_error = "Unknown";
++		break;
++	}
++
++	dev_err(dev, "CRC Error: %s - DATA_ERROR: 0x%lx\n", crc_error,
++			FIELD_GET(SDMMC_STATUS_DATA_ERROR, status));
++}
++
++/*
++ * Finish a data request once the controller signalled it (or failed it):
++ * check the DMA really completed, abort on error, copy a read out of the
++ * bounce buffer. Runs in the request path, which owns the request.
++ */
++static void rda_mmc_finish_data(struct mmc_host *host, struct mmc_request *mrq,
++				struct dma_chan *chan)
++{
++	struct rda_mmc_host *priv = mmc_priv(host);
++	struct device *dev = mmc_dev(host);
++	struct dma_tx_state state;
++	enum dma_status dma_status;
++
++	if (!mrq->data->error) {
++		mrq->data->bytes_xfered = mrq->data->blocks * mrq->data->blksz;
++
++		/*
++		 * With this IP, just because a TXDMA/RXDMA interrupt is triggered,
++		 * doesn't mean the MMC is fully processed.
++		 */
++		dma_status = dmaengine_tx_status(chan, priv->dma_cookie, &state);
++		dev_dbg(dev, "DMA Status: %d\n", dma_status);
++		if (dma_status != DMA_COMPLETE) {
++			dev_err(dev, "Transmit IRQ triggered but DMA is not finished\n");
++			mrq->data->error = -ETIMEDOUT;
++			mrq->data->bytes_xfered = 0;
++		}
++	}
++
++	if (mrq->data->error) {
++		rda_mmc_crc_status(host);
++		rda_mmc_data_abort(host, mrq);
++	} else if (mrq->data->flags & MMC_DATA_READ) {
++		/* Successful read: copy the bounce out to the caller. */
++		sg_copy_from_buffer(mrq->data->sg, mrq->data->sg_len,
++				    priv->bounce, mrq->data->bytes_xfered);
++	}
++
++	/*
++	 * Since we told the controller to automatically send a stop command,
++	 * we don't have to send a stop command here.
++	 */
++	dmaengine_terminate_sync(chan);
++}
++
+ static void rda_mmc_request(struct mmc_host *host, struct mmc_request *req)
+ {
+ 	struct rda_mmc_host *priv = mmc_priv(host);
+@@ -414,6 +488,7 @@ static void rda_mmc_request(struct mmc_host *host, struct mmc_request *req)
+ 	struct mmc_data *data = NULL;
+ 	struct dma_chan *chan;
+ 	unsigned long flags;
++	bool timedout;
+ 
+ 	/*
+ 	 * priv->lock only guards the priv->mrq handoff with the irq thread.
+@@ -421,6 +496,9 @@ static void rda_mmc_request(struct mmc_host *host, struct mmc_request *req)
+ 	 * NEVER run under the spinlock (holding it while sleeping deadlocks
+ 	 * the UP system the moment the irq thread contends the lock).
+ 	 */
++	/* A completion left over from an earlier request must not count. */
++	reinit_completion(&priv->c);
++
+ 	spin_lock_irqsave(&priv->lock, flags);
+ 	WARN_ON(priv->mrq);
+ 	priv->mrq = req;
+@@ -452,30 +530,23 @@ static void rda_mmc_request(struct mmc_host *host, struct mmc_request *req)
+ 	 * However with this IP, if the operation timed out, it will
+ 	 * not trigger an IRQ and we'll not return.
+ 	 */
+-	if (data) {
+-		if (wait_for_completion_timeout(&priv->c,
+-					msecs_to_jiffies(5000)) == 0) {
+-			spin_lock_irqsave(&priv->lock, flags);
+-			if (!priv->mrq) {
+-				/* irq thread finished it just now */
+-				spin_unlock_irqrestore(&priv->lock, flags);
+-				return;
+-			}
+-			priv->mrq = NULL;
+-			spin_unlock_irqrestore(&priv->lock, flags);
++	timedout = !wait_for_completion_timeout(&priv->c, msecs_to_jiffies(5000));
+ 
+-			chan = rda_mmc_get_dma_chan(priv, data);
+-
+-			dmaengine_terminate_sync(chan);
+-			rda_mmc_data_abort(host, req);
++	/* From here on no interrupt touches the request. */
++	spin_lock_irqsave(&priv->lock, flags);
++	priv->mrq = NULL;
++	spin_unlock_irqrestore(&priv->lock, flags);
+ 
+-			req->cmd->error = -ETIMEDOUT;
+-			req->data->error = -ETIMEDOUT;
+-			mmc_request_done(host, req);
+-			return;
+-		}
++	chan = rda_mmc_get_dma_chan(priv, data);
++	if (timedout) {
++		dmaengine_terminate_sync(chan);
++		rda_mmc_data_abort(host, req);
++		req->cmd->error = -ETIMEDOUT;
++		req->data->error = -ETIMEDOUT;
++	} else {
++		rda_mmc_finish_data(host, req, chan);
+ 	}
+-
++	mmc_request_done(host, req);
+ 	return;
+ 
+ done:
+@@ -568,34 +639,6 @@ bailout:
+ 	}
+ }
+ 
+-static void rda_mmc_crc_status(struct mmc_host *host)
+-{
+-	struct rda_mmc_host *priv = mmc_priv(host);
+-	struct device *dev = mmc_dev(host);
+-	void __iomem *base = priv->base;
+-	const char *crc_error;
+-	u32 status;
+-
+-	status = readl_relaxed(base + SDMMC_REG_STATUS);
+-
+-	switch (FIELD_GET(SDMMC_STATUS_CRC_STATUS, status)) {
+-	case 0b101:
+-		crc_error = "Transmission Error";
+-		break;
+-	case 0b010:
+-		crc_error = "Transmission Right";
+-		break;
+-	case 0b111:
+-		crc_error = "Flash Programming Error";
+-		break;
+-	default:
+-		crc_error = "Unknown";
+-		break;
+-	}
+-
+-	dev_err(dev, "CRC Error: %s - DATA_ERROR: 0x%lx\n", crc_error,
+-			FIELD_GET(SDMMC_STATUS_DATA_ERROR, status));
+-}
+ 
+ static irqreturn_t rda_mmc_irq(int irq, void *dev_id)
+ {
+@@ -635,93 +678,35 @@ static irqreturn_t rda_mmc_irq(int irq, void *dev_id)
+ 	if (priv->sdio_irq && (status & SDMMC_INT_SDIO))
+ 		mmc_signal_sdio_irq(host);
+ 
+-	if (!priv->mrq || !priv->mrq->data)
+-		goto irq_done;
+-
+-	mrq = priv->mrq;
+-
+-	if (mrq->data && ((status & SDMMC_INT_RD_ERR) || (status & SDMMC_INT_WR_ERR)))
+-		mrq->data->error = -EILSEQ;
+-
+-	irqret = IRQ_WAKE_THREAD;
+-
+-	/* We got an error, no need to do the additional checks */
+-	if (mrq->data->error)
+-		goto irq_done;
+-
+ 	/*
+-	 * If we don't have any error but DAT_OVER isn't triggered, then we'll assume
+-	 * that we got an unexpected IRQ (during a data transfer)
++	 * The request path owns the request and finishes it; this only flags
++	 * a data error and wakes it. priv->mrq is read once, under the lock:
++	 * the request path clears it when it times out.
+ 	 */
+-	if (!mrq->data->error && !(status & SDMMC_INT_DAT_OVER))
+-		irqret = IRQ_HANDLED;
++	spin_lock(&priv->lock);
++	mrq = priv->mrq;
++	if (mrq && mrq->data) {
++		if (status & (SDMMC_INT_RD_ERR | SDMMC_INT_WR_ERR))
++			mrq->data->error = -EILSEQ;
++		if (mrq->data->error || (status & SDMMC_INT_DAT_OVER))
++			irqret = IRQ_WAKE_THREAD;
++	}
++	spin_unlock(&priv->lock);
+ 
+-irq_done:
+ 	return irqret;
+ }
+ 
+ static irqreturn_t rda_mmc_irq_fn(int irq, void *dev_id)
+ {
+ 	struct rda_mmc_host *priv = dev_id;
+-	struct mmc_host *host = mmc_from_priv(priv);
+-	struct device *dev = mmc_dev(host);
+-	struct mmc_request *mrq;
+-	struct dma_chan *chan;
+-	struct dma_tx_state state;
+-	enum dma_status dma_status;
+-	unsigned long flags;
+-
+-	/* Claim the request under the lock; do all slow work outside it. */
+-	spin_lock_irqsave(&priv->lock, flags);
+-	mrq = priv->mrq;
+-	priv->mrq = NULL;
+-	spin_unlock_irqrestore(&priv->lock, flags);
+-
+-	/* Already finished by the request-timeout path: nothing to do. */
+-	if (!mrq)
+-		return IRQ_HANDLED;
+-
+-	if (mrq->data) {
+-		chan = rda_mmc_get_dma_chan(priv, mrq->data);
+-
+-		if (!mrq->data->error) {
+-			mrq->data->bytes_xfered =
+-				mrq->data->blocks * mrq->data->blksz;
+-
+-			/*
+-			 * With this IP, just because a TXDMA/RXDMA interrupt is triggered,
+-			 * doesn't mean the MMC is fully processed.
+-			 */
+-			dma_status = dmaengine_tx_status(chan, priv->dma_cookie, &state);
+-			dev_dbg(mmc_dev(host), "DMA Status: %d\n", dma_status);
+-			if (dma_status != DMA_COMPLETE) {
+-				dev_err(dev, "Transmit IRQ triggered but DMA is not finished\n");
+-				mrq->data->error = -ETIMEDOUT;
+-				mrq->data->bytes_xfered = 0;
+-			}
+-		}
+-
+-		if (mrq->data->error) {
+-			rda_mmc_crc_status(host);
+-			rda_mmc_data_abort(host, mrq);
+-		} else if (mrq->data->flags & MMC_DATA_READ) {
+-			/* Successful read: copy the bounce out to the caller. */
+-			sg_copy_from_buffer(mrq->data->sg, mrq->data->sg_len,
+-					    priv->bounce,
+-					    mrq->data->bytes_xfered);
+-		}
+-
+-		/*
+-		 * Since we told the controller to automatically send a stop command,
+-		 * we don't have to send a stop command here.
+-		 */
+-		dmaengine_terminate_sync(chan);
+-	}
+ 
++	/*
++	 * Only wake the request path. It used to finish the request here,
++	 * which raced with the request path still sending the command into
++	 * it (use after mmc_request_done) and, after a timeout, left a stale
++	 * completion that made every later wait return at once.
++	 */
+ 	complete(&priv->c);
+-	mmc_request_done(host, mrq);
+-
+-
+ 	return IRQ_HANDLED;
+ }
+ 

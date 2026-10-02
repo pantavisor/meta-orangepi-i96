@@ -74,6 +74,9 @@ SRC_URI:append:orangepi-i96 = " \
     file://rda-mmc-37-wifi-rdawlan-mac-from-boot-cid.patch \
     file://rda-mmc-38-wifi-combo-power-bt-on.patch \
     file://rda-mmc-39-wifi-rdawlan-restore-ap-mode.patch \
+    file://rda-mmc-40-wifi-combo-release-power-token-on-every-path.patch \
+    file://rda-mmc-41-mmc-rda-request-path-owns-its-request.patch \
+    file://rda-mmc-42-wifi-rdawlan-minimal-shutdown.patch \
 "
 
 # Machine restart and power-off. Unrelated to WiFi, but the WiFi bring-up is
