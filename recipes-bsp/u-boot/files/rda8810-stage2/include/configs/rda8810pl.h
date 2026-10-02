@@ -28,7 +28,10 @@
  * scripts/env @loadaddr 0x82000000, fdt @0x83000000, kernel @0x84000000,
  * ramdisk @0x85000000 (initramfs Load Address, clears the ~12 MB zImage).
  * mmcdev: the SD card is mmc 0 here. boot.scr falls back to mmc 1 when neither
- * ${devnum} nor ${mmcdev} is set, and the bootcmd sets neither. */
+ * ${devnum} nor ${mmcdev} is set, and the bootcmd sets neither.
+ * pv_boot_env_on_bootpart: pantavisor's uboot.txt is on the vfat boot
+ * partition (pvmnt.bootvfat), which this u-boot reads reliably; it reads ext4
+ * without replaying the journal. */
 #define CFG_EXTRA_ENV_SETTINGS \
 	"loadaddr=0x82000000\0" \
 	"mmcdev=0\0" \
@@ -37,6 +40,7 @@
 	"kernel_addr_r=0x84000000\0" \
 	"fdt_addr_r=0x83000000\0" \
 	"ramdisk_addr_r=0x85000000\0" \
-	"scriptaddr=0x82000000\0"
+	"scriptaddr=0x82000000\0" \
+	"pv_boot_env_on_bootpart=1\0"
 
 #endif /* __RDA8810PL_H */
