@@ -1,0 +1,107 @@
+From 26c1df674fb418a599e6b387332071b6def25d41 Mon Sep 17 00:00:00 2001
+From: Sergio Marin <sergio.marin@pantacor.com>
+Date: Thu, 29 Oct 2026 10:09:32 -0300
+Subject: [PATCH 1/2] mmc: rda: do not lose a card interrupt while it is masked
+
+On the Orange Pi i96 the WiFi stops receiving after hours of uptime and
+never recovers: wlan0's RX counter freezes while TX keeps counting, the
+mmc1 interrupt count stops moving, DHCP never completes, and toggling
+the interface or the connman technology does not bring it back. Only a
+reboot does.
+
+Two ways for this host driver to lose the SDIO card interrupt:
+
+  - The hard handler wrote every status bit back to INT_CLEAR, the SDIO
+    one included, even while the SDIO interrupt was masked -- that is,
+    while the core's sdio_irq thread was still running the function
+    handler. A request interrupt (DAT_OVER for the function's own CMD53)
+    taken in that window cleared a card interrupt the core had not been
+    told about. If the card was already holding DAT1 when the thread
+    unmasked it again, there was nothing new to latch, and the function
+    was never interrupted again.
+
+  - rda_mmc_sdio_enable_irq() read-modified-wrote INT_MASK and set the
+    sdio_irq flag without a lock. It runs both from the hard handler,
+    through mmc_signal_sdio_irq(), and from the sdio_irq thread, so the
+    mask and the flag the handler tests could end up disagreeing.
+
+Clear the SDIO bit only when it is unmasked, and change INT_MASK and
+sdio_irq together under priv->lock.
+
+Upstream-Status: Inappropriate [fixes a local backport]
+---
+ drivers/mmc/host/rda-mmc.c | 34 +++++++++++++++++++++++++++++-----
+ 1 file changed, 29 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/mmc/host/rda-mmc.c b/drivers/mmc/host/rda-mmc.c
+index 36155aca37ce..332bb4177717 100644
+--- a/drivers/mmc/host/rda-mmc.c
++++ b/drivers/mmc/host/rda-mmc.c
+@@ -491,7 +491,8 @@ static void rda_mmc_request(struct mmc_host *host, struct mmc_request *req)
+ 	bool timedout;
+ 
+ 	/*
+-	 * priv->lock only guards the priv->mrq handoff with the irq thread.
++	 * priv->lock guards the priv->mrq handoff with the irq thread (and the
++	 * SDIO interrupt mask, see rda_mmc_sdio_enable_irq()).
+ 	 * The command path polls registers with sleeping waits, so it must
+ 	 * NEVER run under the spinlock (holding it while sleeping deadlocks
+ 	 * the UP system the moment the irq thread contends the lock).
+@@ -656,8 +657,23 @@ static irqreturn_t rda_mmc_irq(int irq, void *dev_id)
+ 	 */
+ 	irqreturn_t irqret = IRQ_HANDLED;
+ 
++	u32 clear;
++
+ 	status = readl(base + SDMMC_REG_INT_STATUS);
+-	writel((status & 0xFF), base + SDMMC_REG_INT_CLEAR);
++
++	/*
++	 * Leave a card interrupt latched while it is masked. Clearing it here,
++	 * on the way through for a request interrupt, throws it away: the core
++	 * never hears of it, and if the card is already holding DAT1 when the
++	 * interrupt is unmasked again there is nothing new to latch. The WiFi
++	 * function then never interrupts again, and its RX stops for good.
++	 */
++	clear = status & 0xFF;
++	spin_lock(&priv->lock);
++	if (!priv->sdio_irq)
++		clear &= ~SDMMC_INT_SDIO;
++	spin_unlock(&priv->lock);
++	writel(clear, base + SDMMC_REG_INT_CLEAR);
+ 
+ 	dev_dbg(dev, "IRQ requested - status: 0x%x\n", status);
+ 
+@@ -723,8 +739,17 @@ static void rda_mmc_sdio_enable_irq(struct mmc_host *host, int enable)
+ {
+ 	struct rda_mmc_host *priv = mmc_priv(host);
+ 	void __iomem *base = priv->base;
+-	u32 intmask = readl(base + SDMMC_REG_INT_MASK);
++	unsigned long flags;
++	u32 intmask;
+ 
++	/*
++	 * Called from the hard handler (through mmc_signal_sdio_irq()) and from
++	 * the core's sdio_irq thread. The read-modify-write of INT_MASK and
++	 * the sdio_irq flag the handler tests must change together, or the
++	 * two can disagree and a card interrupt is lost.
++	 */
++	spin_lock_irqsave(&priv->lock, flags);
++	intmask = readl(base + SDMMC_REG_INT_MASK);
+ 	if (enable) {
+ 		intmask |= SDMMC_INT_SDIO;
+ 		priv->sdio_irq = true;
+@@ -732,9 +757,8 @@ static void rda_mmc_sdio_enable_irq(struct mmc_host *host, int enable)
+ 		intmask &= ~SDMMC_INT_SDIO;
+ 		priv->sdio_irq = false;
+ 	}
+-
+-
+ 	writel(intmask, base + SDMMC_REG_INT_MASK);
++	spin_unlock_irqrestore(&priv->lock, flags);
+ }
+ 
+ static const struct mmc_host_ops rda_mmc_ops = {
+-- 
+2.56.0
+

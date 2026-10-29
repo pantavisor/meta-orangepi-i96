@@ -1,0 +1,165 @@
+From 75dca110ec81073f8ceeed3734806e4dd5ffdf17 Mon Sep 17 00:00:00 2001
+From: Sergio Marin <sergio.marin@pantacor.com>
+Date: Thu, 29 Oct 2026 10:10:35 -0300
+Subject: [PATCH 2/2] wifi: rdawlan: rescue a lost SDIO interrupt
+
+Once the chip is trapped the driver switches from polling to interrupts
+and sets bus->poll = false, which also switches off the watchdog's
+"no interrupt this period, look at INT_STATUS anyway" check. From then
+on the frame indication reaches the driver only through the function
+IRQ, and a single interrupt lost between the card and the core stops RX
+for good: the frame sits in the RD FIFO, the chip does not signal again,
+the link drops, and toggling the interface does not help because nothing
+re-reads INT_STATUS.
+
+That is what the Orange Pi i96 shows after hours of uptime: wlan0's RX
+counter frozen while TX counts up, the mmc1 interrupt count no longer
+moving, and connman cycling between UP and DORMANT without DHCP.
+
+Add a rescue: a delayed work that checks once a second whether any
+interrupt arrived since the last check, and if none did, runs the
+interrupt handler by hand with the host claimed -- as the core's
+sdio_irq thread would. Usually it finds nothing and costs one CMD52.
+When it finds a frame, an interrupt was lost: it logs that, rate
+limited, and polls at the watchdog's 20 ms until interrupts flow again,
+so RX stays usable even if the interrupt path does not come back.
+
+The watchdog thread cannot carry this: its timer stops whenever the
+chip goes to sleep, which is exactly when a lost interrupt goes
+unnoticed.
+
+The work starts when the function IRQ is claimed, stops re-arming once
+the bus is down, and is cancelled before the handler is released.
+
+Upstream-Status: Inappropriate [local forward-port of vendor driver]
+---
+ .../wireless/rdaw80211/rdawlan/wland_sdio.c   | 61 +++++++++++++++++++
+ .../wireless/rdaw80211/rdawlan/wland_sdmmc.h  | 12 ++++
+ 2 files changed, 73 insertions(+)
+
+diff --git a/drivers/net/wireless/rdaw80211/rdawlan/wland_sdio.c b/drivers/net/wireless/rdaw80211/rdawlan/wland_sdio.c
+index 043ad9c72f04..0c6d938b91e4 100644
+--- a/drivers/net/wireless/rdaw80211/rdawlan/wland_sdio.c
++++ b/drivers/net/wireless/rdaw80211/rdawlan/wland_sdio.c
+@@ -1484,6 +1484,57 @@ int wland_sdio_intr_register(struct wland_sdio_dev *sdiodev)
+ 	return ret;
+ }
+ 
++/*
++ * Rescue a lost SDIO interrupt. Once the driver has switched from polling
++ * to interrupts, the chip's frame indication reaches it only through the
++ * function IRQ, and the watchdog no longer looks at INT_STATUS. A single
++ * interrupt lost between the card and the core is then enough to stop RX
++ * for good: the frame sits in the RD FIFO, the chip never signals again,
++ * and the link drops while TX still counts up.
++ *
++ * So check once a second whether any interrupt arrived. If none did, run
++ * the interrupt handler by hand, as the core's sdio_irq thread would, with
++ * the host claimed. Most of the time it finds nothing and costs one CMD52.
++ * When it does find a frame, an interrupt was lost: keep polling at the
++ * watchdog's rate, as during bring-up, until interrupts flow again.
++ */
++static void wland_sdio_irq_rescue(struct work_struct *work)
++{
++	struct wland_sdio *bus =
++		container_of(to_delayed_work(work), struct wland_sdio, irq_rescue);
++	struct sdio_func *func = bus->sdiodev->func;
++	uint delay = WLAND_IRQ_RESCUE_MS;
++	uint found = 0;
++
++	if (bus->sdiodev->bus_if->state == WLAND_BUS_DOWN || !bus->intr)
++		return;
++
++	if (bus->sdcnt.intrcount == bus->rescue_intrs) {
++		sdio_claim_host(func);
++		do {
++			atomic_set(&bus->intstatus, 0);
++			wland_sdioh_irqhandler(func);
++			if (!(atomic_read(&bus->intstatus) & I_AHB2SDIO))
++				break;
++		} while (++found < WLAND_IRQ_RESCUE_BOUND);
++		sdio_release_host(func);
++	}
++
++	if (found) {
++		bus->rescued += found;
++		delay = WLAND_IRQ_RESCUE_POLL_MS;
++		pr_err_ratelimited("[RDAWLAN_ERR]: SDIO interrupt lost: read %u frame(s) by poll (%u in total)\n",
++			found, bus->rescued);
++	}
++
++	/*
++	 * Counted after the check, so the handler calls made here do not
++	 * pass for interrupts at the next one.
++	 */
++	bus->rescue_intrs = bus->sdcnt.intrcount;
++	schedule_delayed_work(&bus->irq_rescue, msecs_to_jiffies(delay));
++}
++
+ /*
+  * Switch from polling to interrupts. Called once the chip is trapped and
+  * bus->intr has been set, which is where the vendor called
+@@ -1499,6 +1550,9 @@ int wland_sdio_intr_enable(struct wland_sdio_dev *sdiodev)
+ 
+ 	if (ret)
+ 		WLAND_ERR("sdio_claim_irq failed:%d\n", ret);
++	else
++		mod_delayed_work(system_wq, &sdiodev->bus->irq_rescue,
++			msecs_to_jiffies(WLAND_IRQ_RESCUE_MS));
+ 
+ 	WLAND_DBG(SDIO, TRACE, "Done(ret:%d)\n", ret);
+ 
+@@ -1609,6 +1663,12 @@ void wland_sdio_release(struct wland_sdio *bus)
+ 
+ 	bus_if = dev_get_drvdata(bus->sdiodev->dev);
+ 	bus_if->state = WLAND_BUS_DOWN;
++	/*
++	 * Before the handler goes: the rescue runs it. The bus is already
++	 * down, so a rescue in flight does not re-arm itself.
++	 */
++	cancel_delayed_work_sync(&bus->irq_rescue);
++
+ 	/*
+ 	 * De-register interrupt handler
+ 	 */
+@@ -1662,6 +1722,7 @@ void *wland_sdio_probe(struct osl_info *osh, struct wland_sdio_dev *sdiodev)
+ 		goto fail;
+ 
+ 	memset(bus, '\0', sizeof(struct wland_sdio));
++	INIT_DELAYED_WORK(&bus->irq_rescue, wland_sdio_irq_rescue);
+ 
+ 	/*
+ 	 * pointer each other
+diff --git a/drivers/net/wireless/rdaw80211/rdawlan/wland_sdmmc.h b/drivers/net/wireless/rdaw80211/rdawlan/wland_sdmmc.h
+index bc9a8ad54068..c38c85d5f847 100644
+--- a/drivers/net/wireless/rdaw80211/rdawlan/wland_sdmmc.h
++++ b/drivers/net/wireless/rdaw80211/rdawlan/wland_sdmmc.h
+@@ -80,6 +80,11 @@
+ #define WLAND_TXMINMAX	                1	/* Max tx frames if rx still pending */
+ 
+ #define WLAND_IDLE_INTERVAL	            5
++/* Lost-interrupt rescue: check period, and the poll period after a rescue */
++#define WLAND_IRQ_RESCUE_MS		1000
++#define WLAND_IRQ_RESCUE_POLL_MS	WLAND_WD_POLL_MS
++/* Frames one rescue check may read before giving the CPU back */
++#define WLAND_IRQ_RESCUE_BOUND		32
+ 
+ /* clkstate */
+ #define CLK_NONE	                    0
+@@ -156,6 +161,13 @@ struct wland_sdio {
+ 
+ 	struct work_struct work_hang;
+ 
++	/*
++	 * Lost-interrupt rescue, see wland_sdio_irq_rescue()
++	 */
++	struct delayed_work irq_rescue;
++	uint rescue_intrs;	/* intrcount as of the last rescue check */
++	uint rescued;		/* Frames found pending with no interrupt */
++
+ 	/*
+ 	 * Wakelocks
+ 	 */
+-- 
+2.56.0
+

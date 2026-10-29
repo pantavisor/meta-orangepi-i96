@@ -78,6 +78,8 @@ SRC_URI:append:orangepi-i96 = " \
     file://rda-mmc-41-mmc-rda-request-path-owns-its-request.patch \
     file://rda-mmc-42-wifi-rdawlan-minimal-shutdown.patch \
     file://rda-mmc-43-wifi-rdawlan-bound-firmware-lengths.patch \
+    file://rda-mmc-44-mmc-rda-do-not-lose-a-masked-card-interrupt.patch \
+    file://rda-mmc-45-wifi-rdawlan-rescue-a-lost-sdio-interrupt.patch \
 "
 
 # Machine restart and power-off. Unrelated to WiFi, but the WiFi bring-up is
